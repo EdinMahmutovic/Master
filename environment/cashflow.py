@@ -2,6 +2,7 @@ import numpy as np
 from datetime import timedelta
 import pandas as pd
 
+
 class CashFlow:
     def __init__(self, start_date, end_date, daily_cashflows):
         self.start = start_date
