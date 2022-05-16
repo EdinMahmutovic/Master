@@ -130,22 +130,16 @@ class Company:
         self.domestic_ccy = home_currency
         self.ccy = trading_currencies
 
-    def get_lending_rates(self, t):
-        try:
-            weekday = t.weekday()
-            t = t if weekday < 5 else t - timedelta(days=weekday - 4)
-            return self.lending_rates.get_rates(t=t) / 360
-        except KeyError:
-            return None
-
     def get_deposit_rates(self, t):
-        try:
-            weekday = t.weekday()
-            t = t if weekday < 5 else t - timedelta(days=weekday - 4)
-            return self.deposit_rates.get_rates(t=t) / 360
-        except KeyError:
-            return None
+        return self.interest_rates.get_rates(t=t, rate='deposit') / 360
 
+    def get_lending_rates(self, t):
+        return self.interest_rates.get_rates(t=t, rate='lending') / 360
+
+    def get_overdraft_rates(self, t):
+        return self.interest_rates.get_rates(t=t, rate='overdraft') / 360
+
+    # @todo make fee data for everyday
     def get_fees(self, t):
         try:
             weekday = t.weekday()
@@ -154,6 +148,7 @@ class Company:
         except KeyError:
             return None
 
+    # @todo make cashflow data for everyday
     def get_cashflow(self, t):
         try:
             return self.cf.get_cashflow(t=t)
@@ -180,31 +175,54 @@ class InterestRates:
         self.home_ccy = home_ccy
         self.rates = rates
 
+    def get_deposit_levels(self, t, ccy=None):
+        if ccy is None:
+            deposit_limits = {ccy: self.rates[t][ccy]['deposit_limits'] for ccy in self.currencies}
+            return deposit_limits
+        else:
+            return self.rates[t][ccy]['deposit_limits']
+
+    def get_limits(self, t, limit, ccy=None):
+        assert limit in ['deposit', 'lending', 'credit'], "pass valid limit type"
+        if ccy is None:
+            deposit_rates = {ccy: self.rates[t][ccy][f'{limit}_limits'] for ccy in self.currencies}
+            return deposit_rates
+        else:
+            return self.rates[t][ccy][f'{limit}_limits']
+
+    def get_rates(self, t, rate, ccy=None):
+        assert rate in ['deposit', 'lending', 'overdraft'], "pass valid rate type"
+        if ccy is None:
+            deposit_rates = {ccy: self.rates[t][ccy][f'{rate}_rate'] for ccy in self.currencies}
+            return deposit_rates
+        else:
+            return self.rates[t][ccy][f'{rate}_rate']
+
     def update_credit_limit(self, t_new, ccy, update=False):
         if update:
-            self.rates[t_new][ccy]['credit_limit'] = 0 if ccy != self.home_ccy \
+            self.rates[t_new][ccy]['credit_limits'] = 0 if ccy != self.home_ccy \
                 else np.random.randint(low=-10 ** 7, high=-10 ** 5)
         else:
-            self.maintain_previous_value(ccy=ccy, t_new=t_new, key='credit_limit')
+            self.maintain_previous_value(ccy=ccy, t_new=t_new, key='credit_limits')
 
     def update_deposit_levels(self, t_new, ccy, update=False):
         if update:
-            try:
-                if np.random.rand() > 0.5:
-                    self.decrease_num_deposit_levels(ccy, t_new) if np.random.rand() < 0.5 \
-                        else self.increase_num_deposit_levels(ccy=ccy, t_new=t_new)
-                else:
-                    self.update_deposit_amount_levels(ccy=ccy, t_new=t_new)
-            except KeyError:
-                num_deposit_levels = np.random.randint(low=0, high=3)
-                deposit_levels = np.random.randint(low=1, high=10 ** 7, size=num_deposit_levels)
-
-                deposit_limits = np.append(np.array([0]), deposit_levels)
-                deposit_limits = np.append(deposit_limits, deposit_limits[-1] + 0.01)
-                deposit_limits = np.sort(deposit_limits)
-                self.rates[t_new][ccy]["deposit_limits"] = deposit_limits
+            self.modify_num_levels(ccy, t_new) if np.random.rand() > 0.5 \
+                else self.update_deposit_amount_levels(ccy=ccy, t_new=t_new)
         else:
             self.maintain_previous_value(ccy=ccy, t_new=t_new, key='deposit_limits')
+
+    def init_deposit_levels(self, t_new, ccy):
+        num_deposit_levels = np.random.randint(low=0, high=3)
+        deposit_levels = np.random.randint(low=1, high=10 ** 7, size=num_deposit_levels)
+        deposit_limits = np.append(np.array([0]), deposit_levels)
+        deposit_limits = np.sort(deposit_limits)
+        deposit_limits = np.append(deposit_limits, deposit_limits[-1] + 0.01)
+        self.rates[t_new][ccy]["deposit_limits"] = deposit_limits
+
+    def modify_num_levels(self, ccy, t_new):
+        self.decrease_num_deposit_levels(ccy, t_new) if np.random.rand() < 0.5 \
+            else self.increase_num_deposit_levels(ccy=ccy, t_new=t_new)
 
     def decrease_num_deposit_levels(self, ccy, t_new):
         if len(self.rates[self.t][ccy]["deposit_limits"]) < 3:
@@ -214,17 +232,19 @@ class InterestRates:
         deposit_limits = np.insert(deposit_limits, deposit_limits.size, last_level+0.01)
         self.rates[t_new][ccy]["deposit_limits"] = deposit_limits
 
-        deposit_rates = self.rates[t_new][ccy]["deposit_rate"]
+        deposit_rates = self.rates[self.t][ccy]["deposit_rate"]
         deposit_rates = deposit_rates[:-1]
         self.rates[t_new][ccy]["deposit_rate"] = deposit_rates
 
     def increase_num_deposit_levels(self, ccy, t_new):
-        deposit_limits = self.rates[self.t][ccy]["deposit_limits"]
+        deposit_limits = self.rates[self.t][ccy]["deposit_limits"][:-1]
         new_limit = deposit_limits[-1] + np.random.randint(low=10 ** 4, high=10 ** 5)
-        new_deposit_limits = np.append(deposit_limits, new_limit)
+        new_limits = np.array([new_limit, new_limit + 0.01])
+
+        new_deposit_limits = np.append(deposit_limits, new_limits)
         self.rates[t_new][ccy]["deposit_limits"] = new_deposit_limits
 
-        deposit_rates = self.rates[t_new][ccy]["deposit_rate"]
+        deposit_rates = self.rates[self.t][ccy]["deposit_rate"]
         last_rate = deposit_rates[-1] - np.random.uniform(low=0, high=0.005)
         deposit_rates = np.insert(deposit_rates, deposit_rates.size, last_rate)
         self.rates[t_new][ccy]["deposit_rate"] = deposit_rates
@@ -239,52 +259,69 @@ class InterestRates:
 
     def update_lending_limit(self, t_new, ccy, update=False):
         if update:
-            lending_limit = np.random.choice(np.linspace(start=-0.1, stop=-10 ** 6, num=10))
+            lending_limit = self.rates[self.t][ccy]["lending_limits"]
+            lending_limit += np.random.choice(np.linspace(start=-lending_limit, stop=10**6,
+                                                          num=np.random.randint(low=2, high=20)))
             self.rates[t_new][ccy]["lending_limits"] = lending_limit
         else:
             self.maintain_previous_value(ccy=ccy, t_new=t_new, key='lending_limits')
 
+    def init_lending_limit(self, t_new, ccy):
+        lending_limit = np.random.choice(np.linspace(start=-0.1, stop=-10 ** 6, num=10))
+        self.rates[t_new][ccy]["lending_limits"] = lending_limit
+
     def update_lending_rate(self, t_new, ccy, update=False):
         if update:
-            try:
-                lending_rate = self.rates[self.t][ccy]['lending_rate'] + np.random.normal(loc=0, scale=0.005)
-            except KeyError:
-                lending_rate = np.random.uniform(low=0.01, high=0.05)
-
+            lending_rate = self.rates[self.t][ccy]['lending_rate'] + np.random.normal(loc=0, scale=0.005)
             self.rates[t_new][ccy]['lending_rate'] = lending_rate
-
-            if lending_rate < self.rates[t_new][ccy]['deposit_rate'][0]:
-                skew = np.random.uniform(low=0, high=0.01)
-                self.rates[t_new][ccy]['deposit_rate'] = self.rates[t_new][ccy]['lending_rate'] + skew
+            self.check_lending_rate(ccy, t_new)
         else:
             self.maintain_previous_value(ccy=ccy, t_new=t_new, key='lending_rate')
 
+    def check_lending_rate(self, ccy, t_new):
+        lending_rate = self.rates[t_new][ccy]['lending_rate']
+        if lending_rate < self.rates[t_new][ccy]['deposit_rate'][0]:
+            skew = np.random.uniform(low=0, high=0.01)
+            deposit_rates = self.rates[t_new][ccy]['deposit_rate']
+            new_deposit_rates = deposit_rates + skew
+            self.rates[t_new][ccy]['deposit_rate'] = new_deposit_rates
+
+    def init_lending_rate(self, t_new, ccy):
+        lending_rate = np.random.uniform(low=0.01, high=0.05)
+        self.rates[t_new][ccy]['lending_rate'] = lending_rate
+        self.check_lending_rate(ccy, t_new)
+
     def update_deposit_rate(self, t_new, ccy, update=False):
         if update:
-            num_limits = len(self.rates[self.t][ccy]['deposit_limits'])
+            num_limits = len(self.rates[t_new][ccy]['deposit_limits'])
+            random_step = np.random.normal(loc=0, scale=0.01, size=num_limits)
             try:
-                random_step = np.random.normal(loc=0, scale=0.01, size=num_limits)
-                deposit_rates = self.rates[self.t][ccy]['deposit_rate'] + random_step
-                deposit_rates = np.sort(deposit_rates)[::-1]
+                deposit_rates = self.rates[t_new][ccy]['deposit_rate'] + random_step
             except KeyError:
-                deposit_rate0 = np.random.uniform(low=-0.005, high=0.05)
-                deposit_rate_rest = deposit_rate0 - np.random.uniform(low=0.001, high=0.01, size=(num_limits-1))
-                deposit_rates = np.array([deposit_rate0] + [deposit_rate_rest[i] for i in range(num_limits - 1)])
-                deposit_rates = np.sort(deposit_rates)[::-1]
-
+                deposit_rates = self.rates[self.t][ccy]['deposit_rate'] + random_step
+            deposit_rates = np.sort(deposit_rates)[::-1]
             self.rates[t_new][ccy]['deposit_rate'] = deposit_rates
         else:
             self.maintain_previous_value(ccy=ccy, t_new=t_new, key='deposit_rate')
 
+    def init_deposit_rates(self, t_new, ccy):
+        num_limits = len(self.rates[self.t][ccy]['deposit_limits'])
+        deposit_rate0 = np.random.uniform(low=-0.005, high=0.05)
+        deposit_rate_rest = deposit_rate0 - np.random.uniform(low=0.001, high=0.01, size=(num_limits - 1))
+        deposit_rates = np.array([deposit_rate0] + [deposit_rate_rest[i] for i in range(num_limits - 1)])
+        deposit_rates = np.sort(deposit_rates)[::-1]
+        self.rates[t_new][ccy]['deposit_rate'] = deposit_rates
+
     def update_overdraft_rate(self, t_new, ccy, update=False):
         if update:
-            try:
-                overdraft_rate = self.rates[self.t][ccy]['overdraft_rate'] + np.random.normal(loc=0, scale=0.01)
-            except KeyError:
-                overdraft_rate = np.random.uniform(low=0.07, high=0.10)
+            overdraft_rate = self.rates[self.t][ccy]['overdraft_rate'] + np.random.normal(loc=0, scale=0.01)
             self.rates[t_new][ccy]['overdraft_rate'] = overdraft_rate
         else:
             self.maintain_previous_value(ccy=ccy, t_new=t_new, key='overdraft_rate')
+
+    def init_overdraft_rate(self, t_new, ccy):
+        overdraft_rate = np.random.uniform(low=0.07, high=0.10)
+        self.rates[t_new][ccy]['overdraft_rate'] = overdraft_rate
 
     def maintain_previous_value(self, ccy, t_new, key):
         self.rates[t_new][ccy][key] = self.rates[self.t][ccy][key]
@@ -320,8 +357,6 @@ class InterestRates:
                 self.rates[t_new] = self.rates[self.t]
             self.t = t_new
 
-        print("done")
-
     @classmethod
     def generate_random(cls, t1, t2, currencies, home_ccy):
 
@@ -329,11 +364,11 @@ class InterestRates:
         inst = cls(currencies=currencies, home_ccy=home_ccy, rates=rates, day=t1)
         for ccy in currencies:
             inst.update_credit_limit(t_new=t1, ccy=ccy, update=True)
-            inst.update_deposit_levels(t_new=t1, ccy=ccy, update=True)
-            inst.update_lending_limit(t_new=t1, ccy=ccy, update=True)
-            inst.update_deposit_rate(t_new=t1, ccy=ccy, update=True)
-            inst.update_lending_rate(t_new=t1, ccy=ccy, update=True)
-            inst.update_overdraft_rate(t_new=t1, ccy=ccy, update=True)
+            inst.init_deposit_levels(t_new=t1, ccy=ccy)
+            inst.init_lending_limit(t_new=t1, ccy=ccy)
+            inst.init_deposit_rates(t_new=t1, ccy=ccy)
+            inst.init_lending_rate(t_new=t1, ccy=ccy)
+            inst.init_overdraft_rate(t_new=t1, ccy=ccy)
 
         inst.step(end_date=t2)
         return inst
