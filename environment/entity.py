@@ -131,19 +131,25 @@ class Company:
         self.ccy = trading_currencies
 
     def get_deposit_rates(self, t):
-        return self.interest_rates.get_rates(t=t, rate='deposit') / 360
+        try:
+            return self.interest_rates.get_rates(t=t, rate='deposit') / 360
+        except KeyError:
+            return None
 
     def get_lending_rates(self, t):
-        return self.interest_rates.get_rates(t=t, rate='lending') / 360
+        try:
+            return self.interest_rates.get_rates(t=t, rate='lending') / 360
+        except KeyError:
+            return None
 
     def get_overdraft_rates(self, t):
-        return self.interest_rates.get_rates(t=t, rate='overdraft') / 360
+        try:
+            return self.interest_rates.get_rates(t=t, rate='overdraft') / 360
+        except KeyError:
+            return None
 
-    # @todo make fee data for everyday
     def get_fees(self, t):
         try:
-            weekday = t.weekday()
-            t = t if weekday < 5 else t - timedelta(days=weekday - 4)
             return self.fees.get_fees(t=t)
         except KeyError:
             return None
@@ -162,7 +168,7 @@ class Company:
 
         interest_rates = InterestRates.generate_random(t1=t1, t2=t2, currencies=currencies, home_ccy=home_currency)
         fx_fees = FXMargins.generate_random(t1=t1, t2=t2, currencies=currencies)
-        cf = CashFlow.generate_random(t1=t1, t2=t2, fx_rates=fx_rates, ccys=currencies)
+        cf = CashFlow.generate_random(t1=t1, t2=t2, fx_rates=fx_rates, currencies=currencies, home_ccy=home_currency)
         return cls(id=company_id, start_date=t1, end_date=t2, home_currency=home_currency, trading_currencies=currencies,
                    fx_fees=fx_fees, interest_rates=interest_rates, cashflow=cf)
 
@@ -302,7 +308,8 @@ class InterestRates:
             deposit_rates = np.sort(deposit_rates)[::-1]
             self.rates[t_new][ccy]['deposit_rate'] = deposit_rates
         else:
-            self.maintain_previous_value(ccy=ccy, t_new=t_new, key='deposit_rate')
+            if 'deposit_rate' not in self.rates[t_new][ccy]:
+                self.maintain_previous_value(ccy=ccy, t_new=t_new, key='deposit_rate')
 
     def init_deposit_rates(self, t_new, ccy):
         num_limits = len(self.rates[self.t][ccy]['deposit_limits'])
@@ -336,22 +343,22 @@ class InterestRates:
                 for ccy in self.currencies:
 
                     update_credit_limit = True if np.random.rand() < 0.0025 else False
-                    self.update_credit_limit(t_new=t_new, ccy=ccy, update=True)
+                    self.update_credit_limit(t_new=t_new, ccy=ccy, update=update_credit_limit)
 
                     update_deposit_levels = True if np.random.rand() < 0.025 else False
-                    self.update_deposit_levels(t_new=t_new, ccy=ccy, update=True)
+                    self.update_deposit_levels(t_new=t_new, ccy=ccy, update=update_deposit_levels)
 
                     update_lending_limit = True if np.random.rand() < 0.025 else False
-                    self.update_lending_limit(t_new=t_new, ccy=ccy, update=True)
+                    self.update_lending_limit(t_new=t_new, ccy=ccy, update=update_lending_limit)
 
                     update_deposit_rate = True if np.random.rand() < 0.05 else False
-                    self.update_deposit_rate(t_new=t_new, ccy=ccy, update=True)
+                    self.update_deposit_rate(t_new=t_new, ccy=ccy, update=update_deposit_rate)
 
                     update_lending_rate = True if np.random.rand() < 0.05 else False
-                    self.update_lending_rate(t_new=t_new, ccy=ccy, update=True)
+                    self.update_lending_rate(t_new=t_new, ccy=ccy, update=update_lending_rate)
 
                     update_overdraft_rate = True if np.random.rand() < 0.05 else False
-                    self.update_overdraft_rate(t_new=t_new, ccy=ccy, update=True)
+                    self.update_overdraft_rate(t_new=t_new, ccy=ccy, update=update_overdraft_rate)
 
             else:
                 self.rates[t_new] = self.rates[self.t]
@@ -374,54 +381,38 @@ class InterestRates:
         return inst
 
 
-class Rates:
-    def __init__(self, rates, rate_type):
-        self.rates = rates
-        self.rate_type = rate_type
-
-    def get_rates(self, t=None):
-        if t is not None:
-            return self.rates[t]
-        else:
-            return self.rates
-
-    @classmethod
-    def generate_random(cls, t1, t2, rate_type, currencies):
-        days = [t1 + timedelta(days=days) for days in range((t2 - t1).days + 1)
-                if (t1 + timedelta(days=days)).weekday() in [0, 1, 2, 3, 4]]
-
-        low_rate = -0.02 if rate_type == 'DEPOSIT' else 0.02
-        high_rate = 0.04 if rate_type == 'DEPOSIT' else 0.06
-
-        rates = {}
-        rates_t0 = pd.Series(
-            np.random.uniform(low=low_rate, high=high_rate, size=len(currencies)),
-            index=currencies)
-        rates[days[0]] = rates_t0
-
-        for i, day in enumerate(days[1:]):
-            new_rates = rates[days[i]].copy()
-            for ccy in currencies:
-                if np.random.rand() < 0.05:
-                    new_rates[ccy] += np.random.normal(loc=0, scale=0.1)
-                else:
-                    new_rates[ccy] += np.random.normal(loc=0, scale=0.001)
-            rates[day] = new_rates
-
-        return cls(rates=rates, rate_type=rate_type)
-
-
 class FXMargins:
-    def __init__(self, fees):
+    def __init__(self, fees, day, currencies):
+        self.t1 = day
+        self.t = day
+        self.currencies = currencies
         self.fees = fees
 
     def get_fees(self, t):
         return self.fees[t]
 
+    def update_margin(self, fees, ccy):
+        margin_change = 1 + np.random.normal(loc=0, scale=0.10, size=len(self.currencies))
+        fees.loc[ccy, :] *= margin_change
+        fees.loc[:, ccy] *= margin_change
+        return fees
+
+    def step(self, end_date=None):
+        end_date = self.t + timedelta(days=1) if end_date is None else end_date
+
+        while self.t < end_date:
+            t_new = self.t + timedelta(days=1)
+            fees_t_new = self.fees[self.t]
+            if t_new.weekday() < 5:
+                for ccy in self.currencies:
+                    fees_t_new = self.update_margin(fees_t_new, ccy=ccy) if np.random.rand() < 0.025 else fees_t_new
+                self.fees[t_new] = fees_t_new
+            else:
+                self.fees[t_new] = self.fees[self.t]
+            self.t = t_new
+
     @classmethod
     def generate_random(cls, t1, t2, currencies):
-        days = [t1 + timedelta(days=days) for days in range((t2 - t1).days + 1)
-                if (t1 + timedelta(days=days)).weekday() in [0, 1, 2, 3, 4]]
 
         fees = {}
         fees_t0 = pd.DataFrame(
@@ -429,19 +420,12 @@ class FXMargins:
             columns=currencies,
             index=currencies)
         np.fill_diagonal(fees_t0.values, 0)
-        fees[days[0]] = fees_t0
+        fees[t1] = fees_t0
 
-        for i, day in enumerate(days[1:]):
-            new_fees = fees[days[i]].copy()
-            for ccy in currencies:
-                if np.random.rand() < 0.05:
-                    new_fees[ccy] *= 1 + np.random.normal(loc=0, scale=0.10)
-                else:
-                    new_fees[ccy] *= 1 + np.random.normal(loc=0, scale=0.01)
-            np.fill_diagonal(new_fees.values, 0)
-            fees[day] = new_fees
+        inst = cls(fees=fees, day=t1, currencies=currencies)
+        inst.step(end_date=t2)
 
-        return cls(fees=fees)
+        return inst
 
 
 class FXRates:
