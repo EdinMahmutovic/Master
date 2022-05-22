@@ -2,7 +2,7 @@ from environment.entity import Company
 from environment.entity import FXRates
 from environment.agent import NoHandler, AutoFX
 import matplotlib.pyplot as plt
-from datetime import timedelta
+from datetime import timedelta, datetime
 import seaborn as sns
 sns.set_theme()
 
@@ -17,6 +17,7 @@ class Simulation:
 
         self.num_companies = len(companies) if companies else num_companies
         self.fx_rates = fx_rates if fx_rates is not None else FXRates.generate_random(t1=start_date, t2=end_date)
+        # self.fx_rates.generate_new(end_date=datetime(year=2025, month=1, day=1))
 
         self.companies = companies if companies \
             else [Company.generate_new(t1=self.start_date,

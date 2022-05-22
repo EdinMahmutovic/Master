@@ -1,22 +1,35 @@
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from datetime import timedelta
 from environment.cashflow import CashFlow
+from scipy.stats.mstats import gmean
+from datetime import datetime, timedelta
 
 CURRENCIES = ["DKK", "SEK", "NOK", "EUR", "USD"]
 
 
 class Balance:
-    def __init__(self, currencies, home_ccy, balances):
+    def __init__(self, currencies, home_ccy, balances, interest_frequency='quarterly'):
         self.currencies = currencies
         self.home_ccy = home_ccy
         self.values = pd.Series({ccy: balances[ccy] if balances is not None else 0 for ccy in currencies})
         self.num_trades = pd.Series()
+
         self.fx_costs = None
         self.fx_costs_local = None
+
+        self.lending_costs = None
+        self.lending_costs_local = None
+        self.overdraft_costs = None
+        self.overdraft_costs_local = None
+        self.deposit_costs = None
+        self.deposit_costs_local = None
         self.interest_costs = None
         self.interest_costs_local = None
+        self.accrued_interest = pd.Series({ccy: 0 for ccy in self.currencies})
+        self.next_interest_day = None
+        self.interest_frequency = interest_frequency
+
         self.historical_values = None
         self.historical_values_local = None
 
@@ -63,6 +76,51 @@ class Balance:
         self.fx_costs.loc[t, ccy_from] += amount_from * margins.loc[ccy_from, ccy_to]
         self.fx_costs_local.loc[t, ccy_from] = self.fx_costs.loc[t, ccy_from] * fx_rates.loc[ccy_from, self.home_ccy]
 
+    def set_next_interest_day(self, t):
+        if self.interest_frequency == 'monthly':
+            self.set_monthly(t=t)
+        if self.interest_frequency == 'quarterly':
+            self.set_quarterly(t=t)
+        elif self.interest_frequency == "semi-annually":
+            self.set_semi_annually(t=t)
+        elif self.interest_frequency == "annually":
+            self.set_annually(t=t)
+
+    @staticmethod
+    def get_next_business_day(t):
+        if t.weekday() not in range(5):
+            return t + timedelta(days=7 - t.weekday)
+        else:
+            return t
+
+    def set_annually(self, t):
+        annual_next_first_day = datetime(year=t.year+1, month=1, day=1)
+        annual_next_first_day = self.get_next_business_day(t=annual_next_first_day)
+        self.next_interest_day = annual_next_first_day
+
+    def set_semi_annually(self, t):
+        curr_half = (t.month - 1) // 6
+        next_year = t.year if curr_half == 0 else t.year + 1
+        half_next_first_day = datetime(year=next_year, month=6 * curr_half + 1, day=1)
+        half_next_first_day = self.get_next_business_day(t=half_next_first_day)
+        self.next_interest_day = half_next_first_day
+
+    def set_quarterly(self, t):
+        curr_quarter = (t.month - 1) / 3 + 1
+        next_month = (3 * curr_quarter + 1 % 12) + 1
+        next_year = t.year if curr_quarter < 4 else t.year + 1
+        q_next_first_day = datetime(year=next_year, month=next_month, day=1)
+        q_next_first_day = self.get_next_business_day(t=q_next_first_day)
+        self.next_interest_day = q_next_first_day
+
+    def set_monthly(self, t):
+        curr_month = t.month
+        next_month = (curr_month + 1 % 12) + 1
+        next_year = t.year if curr_month < 12 else t.year + 1
+        m_next_first_day = datetime(year=next_year, month=next_month, day=1)
+        m_next_first_day = self.get_next_business_day(t=m_next_first_day)
+        return m_next_first_day
+
     def get_fx_costs(self, local):
         if local:
             return self.fx_costs_local
@@ -75,20 +133,53 @@ class Balance:
         else:
             return self.interest_costs
 
-    def pay_interest(self, t, deposit_rates, lending_rates, fx_rates):
+    def pay_interest(self, t):
+        if t == self.next_interest_day:
+            self.values -= self.accrued_interest
+            self.accrued_interest = 0
+            self.set_next_interest_day(t)
 
-        deposit_costs = self.values[self.values >= 0].multiply(deposit_rates)
-        deposit_costs = deposit_costs[deposit_costs.notnull()]
+    def accrue_interest(self, t, deposit_rates, deposit_limits, lending_rates, lending_limits, overdraft_rates, fx_rates):
+        deposit_costs = self.accrue_deposit_costs(deposit_rates=deposit_rates, deposit_limits=deposit_limits, fx_rates=fx_rates, t=t)
+        lending_costs = self.accrue_lending_costs(lending_rates=lending_rates, lending_limits=lending_limits, fx_rates=fx_rates, t=t)
+        overdraft_costs = self.accrue_overdraft_costs(overdraft_rates=overdraft_rates, lending_limits=lending_limits, fx_rates=fx_rates, t=t)
+        self.accrued_interest -= deposit_costs + lending_costs + overdraft_costs
 
-        lending_costs = self.values[self.values < 0].multiply(lending_rates)
-        lending_costs = lending_costs[lending_costs.notnull()]
+    def accrue_overdraft_costs(self, overdraft_rates, lending_limits, fx_rates, t):
+        overdraft_costs = self.values[self.values < lending_limits] * overdraft_rates / 360
+        overdraft_costs.fillna(0, inplace=True)
+        self.overdraft_costs.loc[t] = overdraft_costs
+        self.overdraft_costs_local.loc[t] = self.overdraft_costs.loc[t] * fx_rates.loc[:, self.home_ccy]
+        return overdraft_costs
 
-        self.interest_costs.loc[t] = self.interest_costs.loc[t].add(deposit_costs, fill_value=0)
-        self.interest_costs.loc[t] = self.interest_costs.loc[t].add(lending_costs, fill_value=0)
+    def accrue_lending_costs(self, lending_rates, lending_limits, fx_rates, t):
+        lending_cost = np.maximum(self.values[self.values < 0], lending_limits) * (lending_rates / 360)
+        self.lending_costs.loc[t] = self.lending_costs.loc[t].add(lending_cost, fill_value=0)
+        self.lending_costs_local.loc[t] = self.lending_costs.loc[t].multiply(fx_rates.loc[:, self.home_ccy])
+        return lending_cost
 
-        self.interest_costs_local.loc[t] = self.interest_costs.loc[t].multiply(
-            fx_rates.loc[self.currencies, self.home_ccy])
-        self.values = self.values.add(self.interest_costs.loc[t])
+    def accrue_deposit_costs(self, deposit_rates, deposit_limits, fx_rates, t):
+        for ccy in self.currencies:
+            ccy_deposit_rates = deposit_rates[ccy]
+            ccy_deposit_limits = deposit_limits[ccy]
+
+            accum_limit = 0
+            for limit_prev, limit_next, rate in zip(ccy_deposit_limits[:-1], ccy_deposit_limits[1:], ccy_deposit_rates):
+                diff = limit_next - limit_prev
+                accrue_amount = np.min(
+                    diff,
+                    (self.values[self.values > 0] - accum_limit)
+                )
+                amount_interest = accrue_amount * rate / 350
+                self.deposit_costs.loc[t] = self.deposit_costs.loc[t].add(amount_interest, fill_value=0)
+                accum_limit += diff
+
+            rate = ccy_deposit_rates[-1]
+            accrue_amount = self.values[self.values > 0] - accum_limit
+            amount_interest = accrue_amount * rate / 360
+            self.deposit_costs.loc[t] = self.deposit_costs.loc[t].add(amount_interest, fill_value=0)
+            self.deposit_costs_local.loc[t] = self.deposit_costs.loc[t] * fx_rates.loc[ccy, self.home_ccy]
+        return self.deposit_costs.loc[t]
 
     def deposit(self, ccy, amount):
         self.values[ccy] += amount
@@ -132,19 +223,19 @@ class Company:
 
     def get_deposit_rates(self, t):
         try:
-            return self.interest_rates.get_rates(t=t, rate='deposit') / 360
+            return self.interest_rates.get_rates(t=t, rate='deposit')
         except KeyError:
             return None
 
     def get_lending_rates(self, t):
         try:
-            return self.interest_rates.get_rates(t=t, rate='lending') / 360
+            return self.interest_rates.get_rates(t=t, rate='lending')
         except KeyError:
             return None
 
     def get_overdraft_rates(self, t):
         try:
-            return self.interest_rates.get_rates(t=t, rate='overdraft') / 360
+            return self.interest_rates.get_rates(t=t, rate='overdraft')
         except KeyError:
             return None
 
@@ -154,7 +245,6 @@ class Company:
         except KeyError:
             return None
 
-    # @todo make cashflow data for everyday
     def get_cashflow(self, t):
         try:
             return self.cf.get_cashflow(t=t)
@@ -429,11 +519,31 @@ class FXMargins:
 
 
 class FXRates:
-    def __init__(self, fx_rates, cov=None, corr=None, cross_volatility=None):
+    def __init__(self, fx_rates, fx_matrix, currencies, t1, t2):
+        self.currencies = currencies
         self.rates = fx_rates
-        self.cov = cov
-        self.corr = corr
-        self.volatility = cross_volatility
+        self.fx_matrix = fx_matrix
+        self.t = t1
+        self.t_last = t2
+
+        self.cov = None
+        self.mean_vol = None
+        self.mean = pd.Series(0, index=self.rates.columns)
+
+    def add_new_day(self, new_rates):
+        self.rates = self.rates.append(new_rates)
+
+    def get_rates_today(self):
+        return self.fx_matrix[self.t]
+
+    def get_latest_row(self):
+        return self.rates.loc[self.t_last]
+
+    def get_latest_rates(self):
+        return self.fx_matrix[self.t_last]
+
+    def step(self):
+        self.t += timedelta(days=1)
 
     def get_rates(self, t):
         try:
@@ -443,6 +553,35 @@ class FXRates:
         except KeyError:
             return None
 
+    def set_cov(self, cov):
+        self.cov = cov
+
+    def set_mean_vol(self, mean_vol):
+        self.mean_vol = mean_vol
+
+    def create_random_generator(self):
+        returns = self.rates.diff()
+
+        cov_mat = returns.cov()
+        self.set_cov(cov=cov_mat)
+
+        mean_vol = returns.rolling(window=30).mean().std()
+        self.set_mean_vol(mean_vol=mean_vol)
+
+    def generate_new(self, end_date=None):
+        t = self.t_last + timedelta(days=1)
+        t2 = t + timedelta(days=1) if end_date is None else end_date
+        new_rates = self.get_latest_row()
+        fx_matrices = self.fx_matrix
+
+        while t < t2:
+            mean = self.mean + np.random.normal(loc=0, scale=self.mean_vol)
+            new_rates += np.random.multivariate_normal(mean=mean, cov=self.cov)
+            new_rates.name = t
+            self.add_new_day(new_rates=new_rates)
+            FXRates.create_fx_matrix(close_rates_day=new_rates, day=t, fx_rates=fx_matrices)
+            t += timedelta(days=1)
+
     @classmethod
     def generate_random(cls, t1, t2):
         tickers = ["{}{}=X".format(ccy1, ccy2) for ccy1 in CURRENCIES for ccy2 in CURRENCIES if ccy2 != ccy1]
@@ -451,37 +590,38 @@ class FXRates:
         # close_rates.to_csv('close_rates.csv', index=True)
         close_rates = pd.read_csv('close_rates.csv', index_col=0)
         close_rates.index = pd.to_datetime(close_rates.index)
-        close_rates_returns = close_rates.pct_change()
+        days = [t1 + timedelta(days=days) for days in range((t2 - t1).days + 1)]
 
-        cov_mat = close_rates_returns.cov()
-        corr_mat = close_rates_returns.corr()
-        rolling_var = close_rates_returns.rolling(window=30).var().var()
-
-        days = [t1 + timedelta(days=days) for days in range((t2 - t1).days + 1)
-                if (t1 + timedelta(days=days)).weekday() in [0, 1, 2, 3, 4]]
-
-        fx_rates = {}
-        error_dates = []
         for day in days:
             try:
-                close_rates_day = close_rates.loc[day]
+                _ = close_rates.loc[day, :]
             except KeyError:
-                error_dates.append(day)
-                continue
+                close_rates.loc[day, :] = None
 
-            fx_rate_day = pd.DataFrame(columns=CURRENCIES, index=CURRENCIES)
+        close_rates.sort_index(inplace=True)
+        close_rates.interpolate(inplace=True)
+        close_rates.fillna(method='backfill', axis=0, inplace=True)
 
-            for ccy1 in CURRENCIES:
-                for ccy2 in CURRENCIES:
-                    if ccy1 != ccy2:
-                        fx_rate_day.loc[ccy1, ccy2] = close_rates_day.loc[ccy1 + ccy2 + "=X"]
-                    else:
-                        fx_rate_day.loc[ccy1, ccy2] = 1
+        fx_rates = cls.create_daily_fx_matrices(close_rates, days)
+        inst = cls(fx_rates=close_rates, fx_matrix=fx_rates, currencies=CURRENCIES, t1=t1, t2=t2)
+        inst.create_random_generator()
+        return inst
 
-            fx_rates[day] = fx_rate_day
+    @classmethod
+    def create_daily_fx_matrices(cls, close_rates, days):
+        fx_rates = {}
+        for day in days:
+            close_rates_day = close_rates.loc[day]
+            cls.create_fx_matrix(close_rates_day, day, fx_rates)
+        return fx_rates
 
-        for day in error_dates:
-            idx = days.index(day)
-            fx_rates[day] = fx_rates[days[idx - 1]] if idx > 0 else fx_rates[days[idx + 1]]
-
-        return cls(fx_rates=fx_rates, cov=cov_mat, corr=corr_mat, cross_volatility=rolling_var)
+    @classmethod
+    def create_fx_matrix(cls, close_rates_day, day, fx_rates):
+        fx_rate_day = pd.DataFrame(columns=CURRENCIES, index=CURRENCIES)
+        for ccy1 in CURRENCIES:
+            for ccy2 in CURRENCIES:
+                if ccy1 != ccy2:
+                    fx_rate_day.loc[ccy1, ccy2] = close_rates_day.loc[ccy1 + ccy2 + "=X"]
+                else:
+                    fx_rate_day.loc[ccy1, ccy2] = 1
+        fx_rates[day] = fx_rate_day

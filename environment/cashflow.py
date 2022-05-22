@@ -54,8 +54,11 @@ class CashFlow:
     def set_supplier_transactions_per_year(self, annual_transactions):
         self.supplier_num_transactions = annual_transactions
 
-    def get_cashflow(self, t):
-        return self.data.loc[t]
+    def get_cashflow(self, t, local=False):
+        if local:
+            return self.data_local.loc[t, :]
+        else:
+            return self.data.loc[t, :]
 
     @classmethod
     def generate_random(cls, t1, t2, fx_rates, currencies, home_ccy):
