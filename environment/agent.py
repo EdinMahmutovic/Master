@@ -4,12 +4,14 @@ import pandas as pd
 
 
 class LiquidityHandler:
-    def __init__(self, companies=None):
+    def __init__(self, t, companies=None, interest_frequency="quarterly"):
         companies = companies if companies is not None else set()
         self.companies = companies
         self.balances = {company: Balance(currencies=company.ccy,
                                           home_ccy=company.domestic_ccy,
-                                          balances=company.start_balance)
+                                          balances=company.start_balance,
+                                          t=t,
+                                          interest_frequency=interest_frequency)
                          for company in companies}
 
     def add_company(self, company):
@@ -52,8 +54,8 @@ class LiquidityHandler:
 
 
 class NoHandler(LiquidityHandler):
-    def __init__(self, companies=None):
-        super().__init__(companies=companies)
+    def __init__(self, t, companies=None):
+        super().__init__(t=t, companies=companies)
         self.id = "NoHandler"
 
     def rebalance(self, t, company, fx_rates):
@@ -62,16 +64,25 @@ class NoHandler(LiquidityHandler):
         balances.name = t
 
         deposit_rates = company.get_deposit_rates(t=t)
+        deposit_limits = company.get_deposit_limits(t=t)
         lending_rates = company.get_lending_rates(t=t)
+        lending_limits = company.get_lending_limits(t=t)
+        overdraft_rates = company.get_overdraft_rates(t=t)
 
         self.balances[company].update_row(fx_rates=fx_rates, home_ccy=company.domestic_ccy)
-        self.balances[company].pay_interest(t=t, deposit_rates=deposit_rates, lending_rates=lending_rates,
-                                            fx_rates=fx_rates)
+        self.balances[company].accrue_interest(t=t,
+                                               deposit_rates=deposit_rates,
+                                               deposit_limits=deposit_limits,
+                                               lending_rates=lending_rates,
+                                               lending_limits=lending_limits,
+                                               overdraft_rates=overdraft_rates,
+                                               fx_rates=fx_rates)
+        self.balances[company].pay_interest(t=t)
 
 
 class AutoFX(LiquidityHandler):
-    def __init__(self, companies=None):
-        super().__init__(companies=companies)
+    def __init__(self, t, companies=None):
+        super().__init__(t=t, companies=companies)
         self.id = "AutoFX"
 
     def reset_balances(self, t, from_ccy, company, balances, fx_rates, fx_margins):
@@ -101,7 +112,10 @@ class AutoFX(LiquidityHandler):
 
         fees = company.get_fees(t=t)
         deposit_rates = company.get_deposit_rates(t=t)
+        deposit_limits = company.get_deposit_limits(t=t)
         lending_rates = company.get_lending_rates(t=t)
+        lending_limits = company.get_lending_limits(t=t)
+        overdraft_rates = company.get_overdraft_rates(t=t)
 
         for ccy1 in company.ccy:
             if ccy1 == home_ccy:
@@ -118,8 +132,14 @@ class AutoFX(LiquidityHandler):
 
         self.reset_balances(t=t, from_ccy=home_ccy, company=company, balances=balances, fx_rates=fx_rates, fx_margins=fees)
         self.balances[company].update_row(fx_rates=fx_rates, home_ccy=home_ccy)
-        self.balances[company].pay_interest(t=t, deposit_rates=deposit_rates, lending_rates=lending_rates,
-                                            fx_rates=fx_rates)
+        self.balances[company].accrue_interest(t=t,
+                                               deposit_rates=deposit_rates,
+                                               deposit_limits=deposit_limits,
+                                               lending_rates=lending_rates,
+                                               lending_limits=lending_limits,
+                                               overdraft_rates=overdraft_rates,
+                                               fx_rates=fx_rates)
+        self.balances[company].pay_interest(t=t)
 
 
 # @Todo implement hindsight LP which knows all future values for n days

@@ -9,7 +9,7 @@ CURRENCIES = ["DKK", "SEK", "NOK", "EUR", "USD"]
 
 
 class Balance:
-    def __init__(self, currencies, home_ccy, balances, interest_frequency='quarterly'):
+    def __init__(self, currencies, home_ccy, balances, t, interest_frequency='quarterly'):
         self.currencies = currencies
         self.home_ccy = home_ccy
         self.values = pd.Series({ccy: balances[ccy] if balances is not None else 0 for ccy in currencies})
@@ -32,6 +32,8 @@ class Balance:
 
         self.historical_values = None
         self.historical_values_local = None
+
+        self.set_next_interest_day(t=t)
 
     def update_row(self, fx_rates, home_ccy):
         if self.historical_values is None:
@@ -67,10 +69,27 @@ class Balance:
 
         if self.interest_costs is None:
             self.interest_costs = pd.DataFrame(0, columns=self.currencies, index=[t])
-            self.interest_costs_local = self.interest_costs.copy()
+            self.interest_costs_local = pd.DataFrame(0, columns=self.currencies, index=[t])
+
+            self.deposit_costs = pd.DataFrame(0, columns=self.currencies, index=[t])
+            self.lending_costs = pd.DataFrame(0, columns=self.currencies, index=[t])
+            self.overdraft_costs = pd.DataFrame(0, columns=self.currencies, index=[t])
+
+            self.deposit_costs_local = pd.DataFrame(0, columns=self.currencies, index=[t])
+            self.lending_costs_local = pd.DataFrame(0, columns=self.currencies, index=[t])
+            self.overdraft_costs_local = pd.DataFrame(0, columns=self.currencies, index=[t])
         else:
             self.interest_costs.loc[t] = 0
             self.interest_costs_local.loc[t] = 0
+
+            self.deposit_costs.loc[t] = 0
+            self.deposit_costs_local.loc[t] = 0
+
+            self.lending_costs.loc[t] = 0
+            self.lending_costs_local.loc[t] = 0
+
+            self.overdraft_costs.loc[t] = 0
+            self.overdraft_costs_local.loc[t] = 0
 
     def update_fx_cost(self, t, amount_from, ccy_from, ccy_to, margins, fx_rates):
         self.fx_costs.loc[t, ccy_from] += amount_from * margins.loc[ccy_from, ccy_to]
@@ -89,7 +108,7 @@ class Balance:
     @staticmethod
     def get_next_business_day(t):
         if t.weekday() not in range(5):
-            return t + timedelta(days=7 - t.weekday)
+            return t + timedelta(days=7 - t.weekday())
         else:
             return t
 
@@ -106,8 +125,8 @@ class Balance:
         self.next_interest_day = half_next_first_day
 
     def set_quarterly(self, t):
-        curr_quarter = (t.month - 1) / 3 + 1
-        next_month = (3 * curr_quarter + 1 % 12) + 1
+        curr_quarter = t.month // 3 + 1
+        next_month = ((3 * curr_quarter) % 12) + 1
         next_year = t.year if curr_quarter < 4 else t.year + 1
         q_next_first_day = datetime(year=next_year, month=next_month, day=1)
         q_next_first_day = self.get_next_business_day(t=q_next_first_day)
@@ -146,39 +165,50 @@ class Balance:
         self.accrued_interest -= deposit_costs + lending_costs + overdraft_costs
 
     def accrue_overdraft_costs(self, overdraft_rates, lending_limits, fx_rates, t):
+        overdraft_rates = pd.Series(overdraft_rates)
+        lending_limits = pd.Series(lending_limits)
+
         overdraft_costs = self.values[self.values < lending_limits] * overdraft_rates / 360
         overdraft_costs.fillna(0, inplace=True)
         self.overdraft_costs.loc[t] = overdraft_costs
         self.overdraft_costs_local.loc[t] = self.overdraft_costs.loc[t] * fx_rates.loc[:, self.home_ccy]
-        return overdraft_costs
+        return self.overdraft_costs.loc[t]
 
     def accrue_lending_costs(self, lending_rates, lending_limits, fx_rates, t):
+        lending_rates = pd.Series(lending_rates)
+        lending_limits = pd.Series(lending_limits)
         lending_cost = np.maximum(self.values[self.values < 0], lending_limits) * (lending_rates / 360)
         self.lending_costs.loc[t] = self.lending_costs.loc[t].add(lending_cost, fill_value=0)
         self.lending_costs_local.loc[t] = self.lending_costs.loc[t].multiply(fx_rates.loc[:, self.home_ccy])
-        return lending_cost
+        return self.lending_costs.loc[t]
 
     def accrue_deposit_costs(self, deposit_rates, deposit_limits, fx_rates, t):
         for ccy in self.currencies:
             ccy_deposit_rates = deposit_rates[ccy]
             ccy_deposit_limits = deposit_limits[ccy]
-
+            balance = self.values.loc[ccy]
             accum_limit = 0
             for limit_prev, limit_next, rate in zip(ccy_deposit_limits[:-1], ccy_deposit_limits[1:], ccy_deposit_rates):
+                if balance <= limit_prev:
+                    break
+
                 diff = limit_next - limit_prev
-                accrue_amount = np.min(
-                    diff,
-                    (self.values[self.values > 0] - accum_limit)
-                )
-                amount_interest = accrue_amount * rate / 350
+                accrue_amount = np.min((diff, balance - accum_limit))
+
+                amount_interest = accrue_amount * rate / 360
                 self.deposit_costs.loc[t] = self.deposit_costs.loc[t].add(amount_interest, fill_value=0)
                 accum_limit += diff
 
-            rate = ccy_deposit_rates[-1]
-            accrue_amount = self.values[self.values > 0] - accum_limit
-            amount_interest = accrue_amount * rate / 360
-            self.deposit_costs.loc[t] = self.deposit_costs.loc[t].add(amount_interest, fill_value=0)
-            self.deposit_costs_local.loc[t] = self.deposit_costs.loc[t] * fx_rates.loc[ccy, self.home_ccy]
+                if balance <= limit_next:
+                    break
+
+            if balance > ccy_deposit_limits[-1]:
+                rate = ccy_deposit_rates[-1]
+                accrue_amount = balance - accum_limit
+                amount_interest = accrue_amount * rate / 360
+                self.deposit_costs.loc[t] = self.deposit_costs.loc[t].add(amount_interest, fill_value=0)
+                self.deposit_costs_local.loc[t] = self.deposit_costs.loc[t] * fx_rates.loc[ccy, self.home_ccy]
+
         return self.deposit_costs.loc[t]
 
     def deposit(self, ccy, amount):
@@ -227,9 +257,21 @@ class Company:
         except KeyError:
             return None
 
+    def get_deposit_limits(self, t):
+        try:
+            return self.interest_rates.get_limits(t=t, limit="deposit")
+        except KeyError:
+            return None
+
     def get_lending_rates(self, t):
         try:
             return self.interest_rates.get_rates(t=t, rate='lending')
+        except KeyError:
+            return None
+
+    def get_lending_limits(self, t):
+        try:
+            return self.interest_rates.get_limits(t=t, limit="lending")
         except KeyError:
             return None
 
@@ -547,9 +589,7 @@ class FXRates:
 
     def get_rates(self, t):
         try:
-            weekday = t.weekday()
-            t = t if weekday < 5 else t - timedelta(days=weekday - 4)
-            return self.rates[t]
+            return self.fx_matrix[t]
         except KeyError:
             return None
 

@@ -22,11 +22,11 @@ class Simulation:
         self.companies = companies if companies \
             else [Company.generate_new(t1=self.start_date,
                                        t2=self.end_date,
-                                       fx_rates=self.fx_rates.rates, company_id=company_id)
+                                       fx_rates=self.fx_rates.fx_matrix, company_id=company_id)
                   for company_id in range(self.num_companies)]
 
-        exit()
-        self.models = [NoHandler(companies=self.companies), AutoFX(companies=self.companies)]
+        self.models = [NoHandler(t=self.start_date, companies=self.companies),
+                       AutoFX(t=self.start_date, companies=self.companies)]
         self.days = [self.start_date + timedelta(days=day) for day in range((self.end_date - self.start_date).days + 1)]
 
         for day in self.days:
