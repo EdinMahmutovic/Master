@@ -151,7 +151,7 @@ class CashFlow:
         return np.random.uniform(low=0, high=1) < num_trans / 360
 
     def sample_cashflow(self, ccy, fx_rates, avg_cashflow):
-        self.data.loc[self.t, ccy] += np.random.normal(loc=avg_cashflow, scale=np.abs(avg_cashflow) * 0.1)
+        self.data.loc[self.t, ccy] += np.random.normal(loc=avg_cashflow, scale=np.abs(avg_cashflow * 0.1))
         self.data_local.loc[self.t, ccy] = self.data.loc[self.t, ccy] * fx_rates[self.t].loc[ccy, self.home_ccy]
 
     @classmethod
@@ -179,7 +179,7 @@ class CashFlow:
 
     @staticmethod
     def generate_random_company_expenses(mean_income_annual, num_suppliers):
-        mean_expense_annual = mean_income_annual * np.random.uniform(low=0.97, high=1.03)
+        mean_expense_annual = mean_income_annual * np.random.uniform(low=0.95, high=1.05)
         supplier_outgoing_share = np.random.uniform(low=1, high=100, size=num_suppliers)
         supplier_outgoing_share_pct = supplier_outgoing_share / np.sum(supplier_outgoing_share)
         return mean_expense_annual, supplier_outgoing_share_pct

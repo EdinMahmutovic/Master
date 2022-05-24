@@ -1,6 +1,8 @@
 from environment.entity import Balance
 import numpy as np
 import pandas as pd
+from mip import Model, xsum, maximize, BINARY, MINIMIZE
+from DQN import DQN
 
 
 class LiquidityHandler:
@@ -142,30 +144,385 @@ class AutoFX(LiquidityHandler):
         self.balances[company].pay_interest(t=t)
 
 
-# @Todo implement hindsight LP which knows all future values for n days
 class HindsightLP(LiquidityHandler):
-    def __init__(self, companies=None, num_days=364):
-        super().__init__(companies=companies)
+    def __init__(self, t, companies=None, horizon=28, num_days=364):
+        super().__init__(companies=companies, t=t)
         self.num_days = num_days
         self.id = "HindsightLP"
+        self.models = {company: Model(sense=MINIMIZE) for company in self.companies}
+        self.horizon = horizon
+        self.build_model(horizon)
+
+    def build_model(self, company, c, r_borrow, r_lend, m, b0, sigma, k, M=10**12):
+        model = self.models[company]
+        y = [[model.add_var(name="RATE_TYPE", var_type=BINARY) for _ in range(len(company.ccy))]
+             for _ in range(self.horizon)]
+        r = [[model.add_var(name="RATE") for _ in range(len(company.ccy))]
+             for _ in range(self.horizon)]
+        b = [[model.add_var(name="BALANCE") for _ in range(len(company.ccy))]
+             for _ in range(self.horizon)]
+        x = [[model.add_var(name="TRANSFER", lb=0)] for _ in range(len(company.ccy))
+             for _ in range(len(company.ccy))
+             for _ in range(self.horizon)]
+        z = [[model.add_var(name="RECEIVE", lb=0)] for _ in range(len(company.ccy))
+             for _ in range(len(company.ccy))
+             for _ in range(self.horizon)]
+
+        for i in range(len(company.ccy)):
+            for j in range(len(company.ccy)):
+                for t in range(self.horizon):
+                    model += z[t][j][i] == x[t][j][i] * m[t][j][i]
+
+        for i in range(len(company.ccy)):
+            model += b[i][0] + xsum(z[i][j][0] for j in range(len(company.ccy))) == b0
+
+        for i in range(len(company.ccy)):
+            for t in range(1, self.horizon):
+                model += b[i][t] == b[i][t - 1] + c[i][t] + xsum(z[i][j][t] for j in range(len(company.ccy)))
+
+        for i in range(len(company.ccy)):
+            for t in range(self.horizon):
+                model += b[i][t] >= M * (1 - y[i][t])
+                model += b[i][t] <= M * y[i][t]
+
+                model += r_borrow[i][t] - M * (1 - y[i][t]) <= r[i][t]
+                model += r_borrow[i][t] + M * (1 - y[i][t]) >= r[i][t]
+
+                model += r_lend[i][t] - M * y[i][t] <= r[i][t]
+                model += r_lend[i][t] + M * y[i][t] >= r[i][t]
+
+        fx_costs = xsum(x[i][j][t] * m[i][j][t]
+                        for i in range(len(company.ccy))
+                        for j in range(len(company.ccy))
+                        for t in range(self.horizon))
+
+        interest_costs = xsum(b[i][t] * r[i][t]
+                              for i in range(len(company.ccy))
+                              for t in range(self.horizon))
+
+        ccy_risk = xsum(k[i] * b[i][t] * y[i][t] * sigma[i]
+                        for i in range(len(company.ccy))
+                        for t in range(self.horizon))
+
+        model.objective = fx_costs + interest_costs + ccy_risk
+
+    def solve(self, company):
+        model = self.models[company]
+        model.optimize()
+        obj_val = model.objective_value
+        x = model.var_by_name('TRANSFER')
+        return obj_val, x.x
+
+    def rebalance(self, t, company, fx_rates):
+        balances = self.get_balance(company)
+        self.balances[company].init_day(t=t)
+        balances.name = t
+        home_ccy = company.domestic_ccy
+
+        if t.weekday() != 4:
+            self.balances[company].update_row(fx_rates=fx_rates, home_ccy=home_ccy)
+            return
+
+        fees = company.get_fees(t=t)
+        deposit_rates = company.get_deposit_rates(t=t)
+        deposit_limits = company.get_deposit_limits(t=t)
+        lending_rates = company.get_lending_rates(t=t)
+        lending_limits = company.get_lending_limits(t=t)
+        overdraft_rates = company.get_overdraft_rates(t=t)
+
+        for ccy1 in company.ccy:
+            if ccy1 == home_ccy:
+                continue
+
+            self.reset_balances(t=t, from_ccy=ccy1, company=company, balances=balances, fx_rates=fx_rates,
+                                fx_margins=fees)
+
+            surplus_cash_from = max(0, balances[ccy1])
+            surplus_cash_to = surplus_cash_from * fx_rates.loc[ccy1, home_ccy] * (1 - fees.loc[ccy1, home_ccy])
+
+            self.balances[company].make_transaction(from_ccy=ccy1, to_ccy=home_ccy,
+                                                    amount_from=surplus_cash_from, amount_to=surplus_cash_to,
+                                                    margins=fees, fx_rates=fx_rates, t=t)
+
+        self.reset_balances(t=t, from_ccy=home_ccy, company=company, balances=balances, fx_rates=fx_rates,
+                            fx_margins=fees)
+        self.balances[company].update_row(fx_rates=fx_rates, home_ccy=home_ccy)
+        self.balances[company].accrue_interest(t=t,
+                                               deposit_rates=deposit_rates,
+                                               deposit_limits=deposit_limits,
+                                               lending_rates=lending_rates,
+                                               lending_limits=lending_limits,
+                                               overdraft_rates=overdraft_rates,
+                                               fx_rates=fx_rates)
+        self.balances[company].pay_interest(t=t)
 
 
-# @Todo implement forecast LP which predicts future cashflows for n days and assumes constant fees and interest rates.
 class ForecastLP(LiquidityHandler):
-    def __init__(self, companies=None, num_days=364):
-        super().__init__(companies=companies)
+    def __init__(self, regression_model, t, companies=None, num_days=364):
+        super().__init__(companies=companies, t=t)
         self.num_days = num_days
+        self.regression = regression_model
+
+    def forcast(self, history):
+        return self.regression(history)
+
+    def build_model(self, company, c, r_borrow, r_lend, m, b0, sigma, k, M=10 ** 12):
+        model = self.models[company]
+        y = [[model.add_var(name="RATE_TYPE", var_type=BINARY) for _ in range(len(company.ccy))]
+             for _ in range(self.horizon)]
+        r = [[model.add_var(name="RATE") for _ in range(len(company.ccy))]
+             for _ in range(self.horizon)]
+        b = [[model.add_var(name="BALANCE") for _ in range(len(company.ccy))]
+             for _ in range(self.horizon)]
+        x = [[model.add_var(name="TRANSFER", lb=0)] for _ in range(len(company.ccy))
+             for _ in range(len(company.ccy))
+             for _ in range(self.horizon)]
+        z = [[model.add_var(name="RECEIVE", lb=0)] for _ in range(len(company.ccy))
+             for _ in range(len(company.ccy))
+             for _ in range(self.horizon)]
+
+        for i in range(len(company.ccy)):
+            for j in range(len(company.ccy)):
+                for t in range(self.horizon):
+                    model += z[t][j][i] == x[t][j][i] * m[t][j][i]
+
+        for i in range(len(company.ccy)):
+            model += b[i][0] + xsum(z[i][j][0] for j in range(len(company.ccy))) == b0
+
+        for i in range(len(company.ccy)):
+            for t in range(1, self.horizon):
+                model += b[i][t] == b[i][t - 1] + c[i][t] + xsum(z[i][j][t] for j in range(len(company.ccy)))
+
+        for i in range(len(company.ccy)):
+            for t in range(self.horizon):
+                model += b[i][t] >= M * (1 - y[i][t])
+                model += b[i][t] <= M * y[i][t]
+
+                model += r_borrow[i][t] - M * (1 - y[i][t]) <= r[i][t]
+                model += r_borrow[i][t] + M * (1 - y[i][t]) >= r[i][t]
+
+                model += r_lend[i][t] - M * y[i][t] <= r[i][t]
+                model += r_lend[i][t] + M * y[i][t] >= r[i][t]
+
+        fx_costs = xsum(x[i][j][t] * m[i][j][t]
+                        for i in range(len(company.ccy))
+                        for j in range(len(company.ccy))
+                        for t in range(self.horizon))
+
+        interest_costs = xsum(b[i][t] * r[i][t]
+                              for i in range(len(company.ccy))
+                              for t in range(self.horizon))
+
+        ccy_risk = xsum(k[i] * b[i][t] * y[i][t] * sigma[i]
+                        for i in range(len(company.ccy))
+                        for t in range(self.horizon))
+
+        model.objective = fx_costs + interest_costs + ccy_risk
+
+    def solve(self, company):
+        model = self.models[company]
+        model.optimize()
+        obj_val = model.objective_value
+        x = model.var_by_name('TRANSFER')
+        return obj_val, x.x
+
+    def rebalance(self, t, company, fx_rates):
+        balances = self.get_balance(company)
+        self.balances[company].init_day(t=t)
+        balances.name = t
+        home_ccy = company.domestic_ccy
+
+        if t.weekday() != 4:
+            self.balances[company].update_row(fx_rates=fx_rates, home_ccy=home_ccy)
+            return
+
+        fees = company.get_fees(t=t)
+        deposit_rates = company.get_deposit_rates(t=t)
+        deposit_limits = company.get_deposit_limits(t=t)
+        lending_rates = company.get_lending_rates(t=t)
+        lending_limits = company.get_lending_limits(t=t)
+        overdraft_rates = company.get_overdraft_rates(t=t)
+
+        for ccy1 in company.ccy:
+            if ccy1 == home_ccy:
+                continue
+
+            self.reset_balances(t=t, from_ccy=ccy1, company=company, balances=balances, fx_rates=fx_rates, fx_margins=fees)
+
+            surplus_cash_from = max(0, balances[ccy1])
+            surplus_cash_to = surplus_cash_from * fx_rates.loc[ccy1, home_ccy] * (1 - fees.loc[ccy1, home_ccy])
+
+            self.balances[company].make_transaction(from_ccy=ccy1, to_ccy=home_ccy,
+                                                    amount_from=surplus_cash_from, amount_to=surplus_cash_to,
+                                                    margins=fees, fx_rates=fx_rates, t=t)
+
+        self.reset_balances(t=t, from_ccy=home_ccy, company=company, balances=balances, fx_rates=fx_rates, fx_margins=fees)
+        self.balances[company].update_row(fx_rates=fx_rates, home_ccy=home_ccy)
+        self.balances[company].accrue_interest(t=t,
+                                               deposit_rates=deposit_rates,
+                                               deposit_limits=deposit_limits,
+                                               lending_rates=lending_rates,
+                                               lending_limits=lending_limits,
+                                               overdraft_rates=overdraft_rates,
+                                               fx_rates=fx_rates)
+        self.balances[company].pay_interest(t=t)
 
 
-# @Todo implement forecast LP which predicts future cashflow distribution and assumes constant fees and interest rates.
 class StochasticLP(LiquidityHandler):
-    def __init__(self, companies=None, num_days=364):
-        super().__init__(companies=companies)
+    def __init__(self, regression_model, t, companies=None, num_days=364):
+        super().__init__(companies=companies, t=t)
         self.num_days = num_days
 
+        self.regression = regression_model
 
-# @Todo implement reinforcement learning agent which minimizes the overall cost.
-class DQN(LiquidityHandler):
-    def __init__(self, companies=None, num_days=364):
-        super().__init__(companies=companies)
+    def forcast(self, history):
+        return self.regression(history)
+
+    def build_model(self, company, c, r_borrow, r_lend, m, b0, sigma, k, M=10 ** 12):
+        model = self.models[company]
+        y = [[model.add_var(name="RATE_TYPE", var_type=BINARY) for _ in range(len(company.ccy))]
+             for _ in range(self.horizon)]
+        r = [[model.add_var(name="RATE") for _ in range(len(company.ccy))]
+             for _ in range(self.horizon)]
+        b = [[model.add_var(name="BALANCE") for _ in range(len(company.ccy))]
+             for _ in range(self.horizon)]
+        x = [[model.add_var(name="TRANSFER", lb=0)] for _ in range(len(company.ccy))
+             for _ in range(len(company.ccy))
+             for _ in range(self.horizon)]
+        z = [[model.add_var(name="RECEIVE", lb=0)] for _ in range(len(company.ccy))
+             for _ in range(len(company.ccy))
+             for _ in range(self.horizon)]
+
+        for i in range(len(company.ccy)):
+            for j in range(len(company.ccy)):
+                for t in range(self.horizon):
+                    model += z[t][j][i] == x[t][j][i] * m[t][j][i]
+
+        for i in range(len(company.ccy)):
+            model += b[i][0] + xsum(z[i][j][0] for j in range(len(company.ccy))) == b0
+
+        for i in range(len(company.ccy)):
+            for t in range(1, self.horizon):
+                model += b[i][t] == b[i][t - 1] + c[i][t] + xsum(z[i][j][t] for j in range(len(company.ccy)))
+
+        for i in range(len(company.ccy)):
+            for t in range(self.horizon):
+                model += b[i][t] >= M * (1 - y[i][t])
+                model += b[i][t] <= M * y[i][t]
+
+                model += r_borrow[i][t] - M * (1 - y[i][t]) <= r[i][t]
+                model += r_borrow[i][t] + M * (1 - y[i][t]) >= r[i][t]
+
+                model += r_lend[i][t] - M * y[i][t] <= r[i][t]
+                model += r_lend[i][t] + M * y[i][t] >= r[i][t]
+
+        fx_costs = xsum(x[i][j][t] * m[i][j][t]
+                        for i in range(len(company.ccy))
+                        for j in range(len(company.ccy))
+                        for t in range(self.horizon))
+
+        interest_costs = xsum(b[i][t] * r[i][t]
+                              for i in range(len(company.ccy))
+                              for t in range(self.horizon))
+
+        ccy_risk = xsum(k[i] * b[i][t] * y[i][t] * sigma[i]
+                        for i in range(len(company.ccy))
+                        for t in range(self.horizon))
+
+        model.objective = fx_costs + interest_costs + ccy_risk
+
+    def solve(self, company):
+        model = self.models[company]
+        model.optimize()
+        obj_val = model.objective_value
+        x = model.var_by_name('TRANSFER')
+        return obj_val, x.x
+
+    def rebalance(self, t, company, fx_rates):
+        balances = self.get_balance(company)
+        self.balances[company].init_day(t=t)
+        balances.name = t
+        home_ccy = company.domestic_ccy
+
+        if t.weekday() != 4:
+            self.balances[company].update_row(fx_rates=fx_rates, home_ccy=home_ccy)
+            return
+
+        fees = company.get_fees(t=t)
+        deposit_rates = company.get_deposit_rates(t=t)
+        deposit_limits = company.get_deposit_limits(t=t)
+        lending_rates = company.get_lending_rates(t=t)
+        lending_limits = company.get_lending_limits(t=t)
+        overdraft_rates = company.get_overdraft_rates(t=t)
+
+        for ccy1 in company.ccy:
+            if ccy1 == home_ccy:
+                continue
+
+            self.reset_balances(t=t, from_ccy=ccy1, company=company, balances=balances, fx_rates=fx_rates, fx_margins=fees)
+
+            surplus_cash_from = max(0, balances[ccy1])
+            surplus_cash_to = surplus_cash_from * fx_rates.loc[ccy1, home_ccy] * (1 - fees.loc[ccy1, home_ccy])
+
+            self.balances[company].make_transaction(from_ccy=ccy1, to_ccy=home_ccy,
+                                                    amount_from=surplus_cash_from, amount_to=surplus_cash_to,
+                                                    margins=fees, fx_rates=fx_rates, t=t)
+
+        self.reset_balances(t=t, from_ccy=home_ccy, company=company, balances=balances, fx_rates=fx_rates, fx_margins=fees)
+        self.balances[company].update_row(fx_rates=fx_rates, home_ccy=home_ccy)
+        self.balances[company].accrue_interest(t=t,
+                                               deposit_rates=deposit_rates,
+                                               deposit_limits=deposit_limits,
+                                               lending_rates=lending_rates,
+                                               lending_limits=lending_limits,
+                                               overdraft_rates=overdraft_rates,
+                                               fx_rates=fx_rates)
+        self.balances[company].pay_interest(t=t)
+
+
+class RLAgent(LiquidityHandler):
+    def __init__(self, t, companies=None, num_days=364):
+        super().__init__(companies=companies, t=t)
         self.num_days = num_days
+        self.dqn = DQN(h=20, w=len(companies), outputs=companies.ccy)
+
+    def rebalance(self, t, company, fx_rates):
+        balances = self.get_balance(company)
+        self.balances[company].init_day(t=t)
+        balances.name = t
+        home_ccy = company.domestic_ccy
+
+        if t.weekday() != 4:
+            self.balances[company].update_row(fx_rates=fx_rates, home_ccy=home_ccy)
+            return
+
+        fees = company.get_fees(t=t)
+        deposit_rates = company.get_deposit_rates(t=t)
+        deposit_limits = company.get_deposit_limits(t=t)
+        lending_rates = company.get_lending_rates(t=t)
+        lending_limits = company.get_lending_limits(t=t)
+        overdraft_rates = company.get_overdraft_rates(t=t)
+
+        for ccy1 in company.ccy:
+            if ccy1 == home_ccy:
+                continue
+
+            self.reset_balances(t=t, from_ccy=ccy1, company=company, balances=balances, fx_rates=fx_rates, fx_margins=fees)
+
+            surplus_cash_from = max(0, balances[ccy1])
+            surplus_cash_to = surplus_cash_from * fx_rates.loc[ccy1, home_ccy] * (1 - fees.loc[ccy1, home_ccy])
+
+            self.balances[company].make_transaction(from_ccy=ccy1, to_ccy=home_ccy,
+                                                    amount_from=surplus_cash_from, amount_to=surplus_cash_to,
+                                                    margins=fees, fx_rates=fx_rates, t=t)
+
+        self.reset_balances(t=t, from_ccy=home_ccy, company=company, balances=balances, fx_rates=fx_rates, fx_margins=fees)
+        self.balances[company].update_row(fx_rates=fx_rates, home_ccy=home_ccy)
+        self.balances[company].accrue_interest(t=t,
+                                               deposit_rates=deposit_rates,
+                                               deposit_limits=deposit_limits,
+                                               lending_rates=lending_rates,
+                                               lending_limits=lending_limits,
+                                               overdraft_rates=overdraft_rates,
+                                               fx_rates=fx_rates)
+        self.balances[company].pay_interest(t=t)

@@ -162,7 +162,10 @@ class Balance:
         deposit_costs = self.accrue_deposit_costs(deposit_rates=deposit_rates, deposit_limits=deposit_limits, fx_rates=fx_rates, t=t)
         lending_costs = self.accrue_lending_costs(lending_rates=lending_rates, lending_limits=lending_limits, fx_rates=fx_rates, t=t)
         overdraft_costs = self.accrue_overdraft_costs(overdraft_rates=overdraft_rates, lending_limits=lending_limits, fx_rates=fx_rates, t=t)
-        self.accrued_interest -= deposit_costs + lending_costs + overdraft_costs
+        accured_interest_today = deposit_costs + lending_costs + overdraft_costs
+        self.accrued_interest -= accured_interest_today
+        self.interest_costs.loc[t, :] = -accured_interest_today
+        self.interest_costs_local.loc[t, :] = self.interest_costs.loc[t, :] * fx_rates.loc[:, self.home_ccy]
 
     def accrue_overdraft_costs(self, overdraft_rates, lending_limits, fx_rates, t):
         overdraft_rates = pd.Series(overdraft_rates)
@@ -196,7 +199,7 @@ class Balance:
                 accrue_amount = np.min((diff, balance - accum_limit))
 
                 amount_interest = accrue_amount * rate / 360
-                self.deposit_costs.loc[t] = self.deposit_costs.loc[t].add(amount_interest, fill_value=0)
+                self.deposit_costs.loc[t, ccy] += amount_interest
                 accum_limit += diff
 
                 if balance <= limit_next:
@@ -206,8 +209,8 @@ class Balance:
                 rate = ccy_deposit_rates[-1]
                 accrue_amount = balance - accum_limit
                 amount_interest = accrue_amount * rate / 360
-                self.deposit_costs.loc[t] = self.deposit_costs.loc[t].add(amount_interest, fill_value=0)
-                self.deposit_costs_local.loc[t] = self.deposit_costs.loc[t] * fx_rates.loc[ccy, self.home_ccy]
+                self.deposit_costs.loc[t, ccy] += amount_interest
+                self.deposit_costs_local.loc[t, ccy] = self.deposit_costs.loc[t, ccy] * fx_rates.loc[ccy, self.home_ccy]
 
         return self.deposit_costs.loc[t]
 
@@ -237,9 +240,9 @@ class Balance:
 
 
 class Company:
-    def __init__(self, id, start_date, end_date, home_currency, trading_currencies,
+    def __init__(self, company_id, start_date, end_date, home_currency, trading_currencies,
                  fx_fees, interest_rates, cashflow, balance_t0=None):
-        self.id = id
+        self.id = company_id
         self.start_date = start_date
         self.end_date = end_date
         self.start_balance = balance_t0
@@ -250,6 +253,15 @@ class Company:
 
         self.domestic_ccy = home_currency
         self.ccy = trading_currencies
+
+    def get_deposit_rates_range(self, t1, t2, idx=0):
+        days = [t1 + timedelta(days=day) for day in range((t2 - t1).days + 1)]
+        rates = pd.DataFrame(columns=self.ccy, index=days)
+        for day in days:
+            deposit_rates = self.get_deposit_rates(t=day)
+            deposit_rate = {ccy: vals[idx] for ccy, vals in deposit_rates.items()}
+            rates.loc[day, :] = deposit_rate
+        return rates
 
     def get_deposit_rates(self, t):
         try:
@@ -263,6 +275,13 @@ class Company:
         except KeyError:
             return None
 
+    def get_lending_rates_range(self, t1, t2):
+        days = [t1 + timedelta(days=day) for day in range((t2 - t1).days + 1)]
+        rates = pd.DataFrame(columns=self.ccy, index=days)
+        for day in days:
+            rates.loc[day, :] = self.get_lending_rates(t=day)
+        return rates
+
     def get_lending_rates(self, t):
         try:
             return self.interest_rates.get_rates(t=t, rate='lending')
@@ -274,6 +293,13 @@ class Company:
             return self.interest_rates.get_limits(t=t, limit="lending")
         except KeyError:
             return None
+
+    def get_overdraft_rates_range(self, t1, t2):
+        days = [t1 + timedelta(days=day) for day in range((t2 - t1).days + 1)]
+        rates = pd.DataFrame(columns=self.ccy, index=days)
+        for day in days:
+            rates.loc[day, :] = self.get_overdraft_rates(t=day)
+        return rates
 
     def get_overdraft_rates(self, t):
         try:
@@ -301,7 +327,7 @@ class Company:
         interest_rates = InterestRates.generate_random(t1=t1, t2=t2, currencies=currencies, home_ccy=home_currency)
         fx_fees = FXMargins.generate_random(t1=t1, t2=t2, currencies=currencies)
         cf = CashFlow.generate_random(t1=t1, t2=t2, fx_rates=fx_rates, currencies=currencies, home_ccy=home_currency)
-        return cls(id=company_id, start_date=t1, end_date=t2, home_currency=home_currency, trading_currencies=currencies,
+        return cls(company_id=company_id, start_date=t1, end_date=t2, home_currency=home_currency, trading_currencies=currencies,
                    fx_fees=fx_fees, interest_rates=interest_rates, cashflow=cf)
 
 
@@ -420,9 +446,9 @@ class InterestRates:
         lending_rate = self.rates[t_new][ccy]['lending_rate']
         if lending_rate < self.rates[t_new][ccy]['deposit_rate'][0]:
             skew = np.random.uniform(low=0, high=0.01)
-            deposit_rates = self.rates[t_new][ccy]['deposit_rate']
-            new_deposit_rates = deposit_rates + skew
-            self.rates[t_new][ccy]['deposit_rate'] = new_deposit_rates
+            deposit_rates = self.rates[t_new][ccy]['deposit_rate'][0]
+            new_lending_rates = deposit_rates + skew
+            self.rates[t_new][ccy]['lending_rate'] = new_lending_rates
 
     def init_lending_rate(self, t_new, ccy):
         lending_rate = np.random.uniform(low=0.01, high=0.05)
