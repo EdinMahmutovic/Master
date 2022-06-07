@@ -48,14 +48,14 @@ class Balance:
             local_values.name = self.values.name
             self.historical_values_local = self.historical_values_local.append(local_values)
 
-    def make_transaction(self, from_ccy, to_ccy, amount_from, amount_to, margins, fx_rates, t):
+    def make_transaction(self, from_ccy, to_ccy, amount_from, margins, fx_rates, t):
         if amount_from > 0:
             self.num_trades.loc[t] += 1
-
-        self.update_fx_cost(t=t, amount_from=amount_from, ccy_from=from_ccy, ccy_to=to_ccy,
-                            margins=margins, fx_rates=fx_rates)
-        self.withdraw(ccy=from_ccy, amount=amount_from)
-        self.deposit(ccy=to_ccy, amount=amount_to)
+            amount_to = amount_from * (1 - margins.loc[from_ccy, to_ccy]) * fx_rates.loc[from_ccy, to_ccy]
+            self.update_fx_cost(t=t, amount_from=amount_from, ccy_from=from_ccy, ccy_to=to_ccy,
+                                margins=margins, fx_rates=fx_rates)
+            self.withdraw(ccy=from_ccy, amount=amount_from)
+            self.deposit(ccy=to_ccy, amount=amount_to)
 
     def init_day(self, t):
         self.num_trades = self.num_trades.append(pd.Series({t: 0}))
@@ -263,6 +263,9 @@ class Company:
             rates.loc[day, :] = deposit_rate
         return rates
 
+    def get_future_deposit_rates(self, t1, horizon):
+        return self.interest_rates.get_rates_period(t1=t1, t2=(t1 + timedelta(days=horizon - 1)), rate_type="deposit")
+
     def get_deposit_rates(self, t):
         try:
             return self.interest_rates.get_rates(t=t, rate='deposit')
@@ -282,17 +285,31 @@ class Company:
             rates.loc[day, :] = self.get_lending_rates(t=day)
         return rates
 
+    def get_future_lending_rates(self, t1, horizon):
+        return self.interest_rates.get_rates_period(t1=t1, t2=(t1 + timedelta(days=horizon - 1)), rate_type="lending")
+
     def get_lending_rates(self, t):
         try:
             return self.interest_rates.get_rates(t=t, rate='lending')
         except KeyError:
             return None
 
+    def get_lending_limits_period(self, t1, horizon):
+        t2 = t1 + timedelta(days=horizon)
+        days = [t1 + timedelta(days=i) for i in range((t2 - t1).days)]
+        limits = pd.DataFrame(0, columns=self.ccy, index=days)
+        for day in days:
+            limits.loc[day, :] = -pd.Series(self.get_lending_limits(t=day))
+        return limits
+
     def get_lending_limits(self, t):
         try:
             return self.interest_rates.get_limits(t=t, limit="lending")
         except KeyError:
             return None
+
+    def get_future_overdraft_rates(self, t1, horizon):
+        return self.interest_rates.get_rates_period(t1=t1, t2=(t1 + timedelta(days=horizon - 1)), rate_type="overdraft")
 
     def get_overdraft_rates_range(self, t1, t2):
         days = [t1 + timedelta(days=day) for day in range((t2 - t1).days + 1)]
@@ -307,11 +324,28 @@ class Company:
         except KeyError:
             return None
 
+    def get_credit_limits_period(self, t1, horizon):
+        t2 = t1 + timedelta(days=horizon)
+        days = [t1 + timedelta(days=i) for i in range((t2 - t1).days)]
+        limits = pd.DataFrame(0, columns=self.ccy, index=days)
+        for day in days:
+            limits.loc[day, :] = self.get_credit_limits(t=day)
+        return limits
+
+    def get_credit_limits(self, t, ccy=None):
+        return self.interest_rates.get_limits(limit="credit", t=t, ccy=ccy)
+
+    def get_future_fees(self, t1, horizon):
+        return self.fees.get_fees_period(t1, t2=(t1 + timedelta(days=horizon)))
+
     def get_fees(self, t):
         try:
             return self.fees.get_fees(t=t)
         except KeyError:
             return None
+
+    def get_future_cashflow(self, t1, horizon):
+        return self.cf.get_cashflow_period(t1=t1, t2=(t1 + timedelta(days=horizon - 1)))
 
     def get_cashflow(self, t):
         try:
@@ -321,7 +355,7 @@ class Company:
 
     @classmethod
     def generate_new(cls, t1, t2, fx_rates, company_id=None):
-        currencies = np.random.choice(CURRENCIES, size=np.random.randint(low=3, high=len(CURRENCIES)), replace=False)
+        currencies = np.random.choice(CURRENCIES, size=np.random.randint(3, len(CURRENCIES)), replace=False)
         home_currency = np.random.choice(currencies)
 
         interest_rates = InterestRates.generate_random(t1=t1, t2=t2, currencies=currencies, home_ccy=home_currency)
@@ -349,10 +383,20 @@ class InterestRates:
     def get_limits(self, t, limit, ccy=None):
         assert limit in ['deposit', 'lending', 'credit'], "pass valid limit type"
         if ccy is None:
-            deposit_rates = {ccy: self.rates[t][ccy][f'{limit}_limits'] for ccy in self.currencies}
-            return deposit_rates
+            limits = {ccy: self.rates[t][ccy][f'{limit}_limits'] for ccy in self.currencies}
+            return limits
         else:
             return self.rates[t][ccy][f'{limit}_limits']
+
+    def get_rates_period(self, t1, t2, rate_type):
+        days = [t1 + timedelta(days=i) for i in range((t2 - t1).days + 1)]
+        rates = pd.DataFrame(0, columns=self.currencies, index=days)
+        for day in days:
+            rates_temp = self.get_rates(t=day, rate=rate_type)
+            rates_temp = pd.Series({ccy: rate_vals[0] if hasattr(rate_vals, '__len__') else rate_vals
+                                    for ccy, rate_vals in rates_temp.items()})
+            rates.loc[day, :] = rates_temp
+        return rates
 
     def get_rates(self, t, rate, ccy=None):
         assert rate in ['deposit', 'lending', 'overdraft'], "pass valid rate type"
@@ -481,11 +525,18 @@ class InterestRates:
         if update:
             overdraft_rate = self.rates[self.t][ccy]['overdraft_rate'] + np.random.normal(loc=0, scale=0.01)
             self.rates[t_new][ccy]['overdraft_rate'] = overdraft_rate
+
+            self.check_overdraft_rate(ccy, t_new)
         else:
             self.maintain_previous_value(ccy=ccy, t_new=t_new, key='overdraft_rate')
 
+    def check_overdraft_rate(self, ccy, t_new):
+        if self.rates[t_new][ccy]['overdraft_rate'] < self.rates[t_new][ccy]['lending_rate']:
+            overdraft_rate = self.rates[t_new][ccy]['lending_rate'] + np.random.uniform(low=0.05, high=0.8)
+            self.rates[t_new][ccy]['overdraft_rate'] = overdraft_rate
+
     def init_overdraft_rate(self, t_new, ccy):
-        overdraft_rate = np.random.uniform(low=0.07, high=0.10)
+        overdraft_rate = self.rates[t_new][ccy]['lending_rate'] + np.random.uniform(low=0.03, high=0.05)
         self.rates[t_new][ccy]['overdraft_rate'] = overdraft_rate
 
     def maintain_previous_value(self, ccy, t_new, key):
@@ -545,6 +596,13 @@ class FXMargins:
         self.t = day
         self.currencies = currencies
         self.fees = fees
+
+    def get_fees_period(self, t1, t2):
+        days = [t1 + timedelta(days=i) for i in range((t2 - t1).days)]
+        fees = np.zeros((len(self.currencies), len(self.currencies), 0))
+        for day in days:
+            fees = np.dstack((fees, self.get_fees(t=day).values))
+        return fees
 
     def get_fees(self, t):
         return self.fees[t]
@@ -634,6 +692,15 @@ class FXRates:
         mean_vol = returns.rolling(window=30).mean().std()
         self.set_mean_vol(mean_vol=mean_vol)
 
+    def get_rates_period(self, currencies, t1, horizon):
+        t2 = t1 + timedelta(days=horizon)
+        days = [t1 + timedelta(days=i) for i in range((t2 - t1).days)]
+        fx_rates = np.zeros((len(currencies), len(currencies), horizon))
+        for idx, day in enumerate(days):
+            fx_matrix = self.get_rates(t=day)
+            fx_rates[:, :, idx] = fx_matrix.loc[currencies, currencies].values
+        return fx_rates
+
     def generate_new(self, end_date=None):
         t = self.t_last + timedelta(days=1)
         t2 = t + timedelta(days=1) if end_date is None else end_date
@@ -647,6 +714,18 @@ class FXRates:
             self.add_new_day(new_rates=new_rates)
             FXRates.create_fx_matrix(close_rates_day=new_rates, day=t, fx_rates=fx_matrices)
             t += timedelta(days=1)
+
+    def get_volatility(self, home_ccy, currencies, t, horizon=180):
+        t1 = t - timedelta(days=horizon)
+        t2 = t
+        days = [t1 + timedelta(days=i) for i in range(1, (t2 - t1).days + 1)]
+        rates = pd.DataFrame(0, columns=currencies, index=days)
+        for day in days:
+            rates_mat = self.get_rates(t=day)
+            rates.loc[day, :] = rates_mat.loc[home_ccy, currencies]
+        rates_returns = rates.pct_change()
+        ccy_vol = rates_returns.std(axis=0)
+        return ccy_vol
 
     @classmethod
     def generate_random(cls, t1, t2):

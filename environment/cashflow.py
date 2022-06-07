@@ -54,6 +54,12 @@ class CashFlow:
     def set_supplier_transactions_per_year(self, annual_transactions):
         self.supplier_num_transactions = annual_transactions
 
+    def get_cashflow_period(self, t1, t2, local=False):
+        if local:
+            return self.data_local.loc[t1:t2, :]
+        else:
+            return self.data.loc[t1:t2, :]
+
     def get_cashflow(self, t, local=False):
         if local:
             return self.data_local.loc[t, :]
@@ -192,10 +198,10 @@ class CashFlow:
         return customer_income_share_pct, mean_income_annual
 
     def generate_random_customer_info(self, currencies):
-        num_customers = np.random.randint(low=1, high=50)
+        num_customers = np.random.randint(low=1, high=10)
         self.set_num_customers(num_customers=num_customers)
 
-        customer_num_transactions = np.random.randint(low=1, high=50, size=self.num_customers)
+        customer_num_transactions = np.random.randint(low=1, high=10, size=self.num_customers)
         self.set_customer_transactions_per_year(annual_transactions=customer_num_transactions)
 
         customer_ccy = np.random.choice(currencies, size=self.num_customers, replace=True)
@@ -205,7 +211,7 @@ class CashFlow:
         num_suppliers = np.random.randint(low=1, high=50)
         self.set_num_suppliers(num_suppliers=num_suppliers)
 
-        supplier_num_transactions = np.random.randint(low=1, high=50, size=self.num_suppliers)
+        supplier_num_transactions = np.random.randint(low=1, high=40, size=self.num_suppliers)
         self.set_supplier_transactions_per_year(annual_transactions=supplier_num_transactions)
 
         supplier_ccy = np.random.choice(currencies, size=self.num_suppliers, replace=True)

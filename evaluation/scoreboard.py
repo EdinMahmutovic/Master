@@ -1,6 +1,7 @@
 import matplotlib.pyplot as plt
 from datetime import timedelta
 import pandas as pd
+import numpy as np
 
 
 class Scoreboard:
@@ -29,9 +30,11 @@ class Scoreboard:
                           for model in self.env.models
                           for company in self.env.companies}
 
+        fx_costs_autofx = None
         for model in self.env.models:
             figs, axs = plt.subplots(nrows=3, ncols=2, figsize=(20, 15), sharex='row')
             for company in self.env.companies:
+
                 balances[model, company].plot(ax=axs[0, 0], label=model.id)
                 axs[0, 0].set_title('Balances Company {}'.format(company.id))
                 axs[0, 0].set_xlabel('Date')
