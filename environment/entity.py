@@ -4,8 +4,10 @@ import yfinance as yf
 from environment.cashflow import CashFlow
 from scipy.stats.mstats import gmean
 from datetime import datetime, timedelta
+import pickle
 
-CURRENCIES = ["DKK", "SEK", "NOK", "EUR", "USD"]
+
+CURRENCIES = ["DKK", "SEK", "NOK", "EUR", "USD", 'JPY', 'GBP', 'CNY', 'AUD']
 
 
 class Balance:
@@ -40,6 +42,7 @@ class Balance:
             self.historical_values = self.values.to_frame().transpose()
             self.historical_values_local = (
                 self.values.multiply(fx_rates.loc[self.currencies, home_ccy])).to_frame().transpose()
+            self.historical_values_local.index = self.historical_values.index
         else:
             self.historical_values = self.historical_values.append(self.values)
             local_values = self.values.multiply(fx_rates.loc[self.currencies, home_ccy]) if fx_rates is not None \
@@ -152,6 +155,24 @@ class Balance:
         else:
             return self.interest_costs
 
+    def get_deposit_costs(self, local):
+        if local:
+            return self.deposit_costs_local
+        else:
+            return self.deposit_costs
+
+    def get_lending_costs(self, local):
+        if local:
+            return self.lending_costs_local
+        else:
+            return self.lending_costs
+
+    def get_overdraft_costs(self, local):
+        if local:
+            return self.overdraft_costs_local
+        else:
+            return self.overdraft_costs
+
     def pay_interest(self, t):
         if t == self.next_interest_day:
             self.values -= self.accrued_interest
@@ -163,15 +184,15 @@ class Balance:
         lending_costs = self.accrue_lending_costs(lending_rates=lending_rates, lending_limits=lending_limits, fx_rates=fx_rates, t=t)
         overdraft_costs = self.accrue_overdraft_costs(overdraft_rates=overdraft_rates, lending_limits=lending_limits, fx_rates=fx_rates, t=t)
         accured_interest_today = deposit_costs + lending_costs + overdraft_costs
-        self.accrued_interest -= accured_interest_today
-        self.interest_costs.loc[t, :] = -accured_interest_today
+        self.accrued_interest += accured_interest_today
+        self.interest_costs.loc[t, :] = accured_interest_today
         self.interest_costs_local.loc[t, :] = self.interest_costs.loc[t, :] * fx_rates.loc[:, self.home_ccy]
 
     def accrue_overdraft_costs(self, overdraft_rates, lending_limits, fx_rates, t):
         overdraft_rates = pd.Series(overdraft_rates)
         lending_limits = pd.Series(lending_limits)
 
-        overdraft_costs = self.values[self.values < lending_limits] * overdraft_rates / 360
+        overdraft_costs = -(self.values[self.values < -lending_limits] + lending_limits) * overdraft_rates / 360
         overdraft_costs.fillna(0, inplace=True)
         self.overdraft_costs.loc[t] = overdraft_costs
         self.overdraft_costs_local.loc[t] = self.overdraft_costs.loc[t] * fx_rates.loc[:, self.home_ccy]
@@ -180,12 +201,14 @@ class Balance:
     def accrue_lending_costs(self, lending_rates, lending_limits, fx_rates, t):
         lending_rates = pd.Series(lending_rates)
         lending_limits = pd.Series(lending_limits)
-        lending_cost = np.maximum(self.values[self.values < 0], lending_limits) * (lending_rates / 360)
+        lending_cost = -np.maximum(self.values[self.values < 0], -lending_limits) * (lending_rates / 360)
         self.lending_costs.loc[t] = self.lending_costs.loc[t].add(lending_cost, fill_value=0)
         self.lending_costs_local.loc[t] = self.lending_costs.loc[t].multiply(fx_rates.loc[:, self.home_ccy])
         return self.lending_costs.loc[t]
 
     def accrue_deposit_costs(self, deposit_rates, deposit_limits, fx_rates, t):
+
+        dict_check = deposit_limits.copy()
         for ccy in self.currencies:
             ccy_deposit_rates = deposit_rates[ccy]
             ccy_deposit_limits = deposit_limits[ccy]
@@ -198,7 +221,7 @@ class Balance:
                 diff = limit_next - limit_prev
                 accrue_amount = np.min((diff, balance - accum_limit))
 
-                amount_interest = accrue_amount * rate / 360
+                amount_interest = -accrue_amount * rate / 360
                 self.deposit_costs.loc[t, ccy] += amount_interest
                 accum_limit += diff
 
@@ -212,6 +235,7 @@ class Balance:
                 self.deposit_costs.loc[t, ccy] += amount_interest
                 self.deposit_costs_local.loc[t, ccy] = self.deposit_costs.loc[t, ccy] * fx_rates.loc[ccy, self.home_ccy]
 
+        assert dict_check == deposit_limits, dict_check
         return self.deposit_costs.loc[t]
 
     def deposit(self, ccy, amount):
@@ -253,6 +277,9 @@ class Company:
 
         self.domestic_ccy = home_currency
         self.ccy = trading_currencies
+
+    def get_accumulated_cashflow(self):
+        return self.cf.cumsum(axis=0)
 
     def get_deposit_rates_range(self, t1, t2, idx=0):
         days = [t1 + timedelta(days=day) for day in range((t2 - t1).days + 1)]
@@ -353,14 +380,27 @@ class Company:
         except KeyError:
             return None
 
+
     @classmethod
     def generate_new(cls, t1, t2, fx_rates, company_id=None):
-        currencies = np.random.choice(CURRENCIES, size=np.random.randint(3, len(CURRENCIES)), replace=False)
-        home_currency = np.random.choice(currencies)
+        #currencies = np.random.choice(CURRENCIES, size=np.random.randint(3, len(CURRENCIES)), replace=False)
+        currencies = np.random.choice(CURRENCIES, size=7, replace=False)
+        if "DKK" not in currencies:
+            currencies[0] = "DKK"
+        home_currency = "DKK"
 
         interest_rates = InterestRates.generate_random(t1=t1, t2=t2, currencies=currencies, home_ccy=home_currency)
         fx_fees = FXMargins.generate_random(t1=t1, t2=t2, currencies=currencies)
+
         cf = CashFlow.generate_random(t1=t1, t2=t2, fx_rates=fx_rates, currencies=currencies, home_ccy=home_currency)
+        unique_id = np.random.randint(low=0, high=10**12)
+        inst = cls(company_id=unique_id, start_date=t1, end_date=t2, home_currency=home_currency,
+                   trading_currencies=currencies, fx_fees=fx_fees, interest_rates=interest_rates, cashflow=cf)
+
+        pickle_file = open(f'companies/{unique_id}_{len(currencies)}', 'wb')
+        pickle.dump(inst, pickle_file)
+        pickle_file.close()
+
         return cls(company_id=company_id, start_date=t1, end_date=t2, home_currency=home_currency, trading_currencies=currencies,
                    fx_fees=fx_fees, interest_rates=interest_rates, cashflow=cf)
 
@@ -415,7 +455,7 @@ class InterestRates:
 
     def update_deposit_levels(self, t_new, ccy, update=False):
         if update:
-            self.modify_num_levels(ccy, t_new) if np.random.rand() > 0.5 \
+            self.modify_num_levels(ccy, t_new) if np.random.rand() > 1 \
                 else self.update_deposit_amount_levels(ccy=ccy, t_new=t_new)
         else:
             self.maintain_previous_value(ccy=ccy, t_new=t_new, key='deposit_limits')
@@ -459,11 +499,20 @@ class InterestRates:
 
     def update_deposit_amount_levels(self, ccy, t_new):
         deposit_limits = self.rates[self.t][ccy]["deposit_limits"]
-        deposit_limits[1:-1] += np.random.randint(low=-10 ** 4, high=10 ** 4, size=(len(deposit_limits) - 2))
-        deposit_limits = np.sort(deposit_limits[:-1])
-        last_limit = deposit_limits[-1]
-        deposit_limits = np.insert(deposit_limits, deposit_limits.size, last_limit + 0.01)
-        self.rates[t_new][ccy]["deposit_limits"] = deposit_limits
+        deposit_rates = self.rates[self.t][ccy]["deposit_rate"]
+
+        deposit_limits_tnew = deposit_limits.copy()
+        deposit_rates_tnew = deposit_rates.copy()
+        deposit_limits_tnew[1:-1] += deposit_limits[1:-1] + np.random.randint(low=-10 ** 5, high=10 ** 5, size=(len(deposit_limits) - 2))
+
+        deposit_rates_tnew = deposit_rates_tnew[deposit_limits_tnew >= 0]
+        deposit_limits_tnew = deposit_limits_tnew[deposit_limits_tnew >= 0]
+
+        deposit_limits_sorted = np.sort(deposit_limits_tnew[:-1])
+        last_limit = deposit_limits_sorted[-1]
+        deposit_limits_new = np.insert(deposit_limits_sorted, deposit_limits_sorted.size, last_limit + 0.01)
+        self.rates[t_new][ccy]["deposit_limits"] = deposit_limits_new
+        self.rates[t_new][ccy]["deposit_rate"] = deposit_rates_tnew
 
     def update_lending_limit(self, t_new, ccy, update=False):
         if update:
@@ -502,11 +551,16 @@ class InterestRates:
     def update_deposit_rate(self, t_new, ccy, update=False):
         if update:
             num_limits = len(self.rates[t_new][ccy]['deposit_limits'])
-            random_step = np.random.normal(loc=0, scale=0.01, size=num_limits)
+            random_step = np.random.normal(loc=0, scale=0.01)
             try:
-                deposit_rates = self.rates[t_new][ccy]['deposit_rate'] + random_step
+                deposit_rate0 = self.rates[t_new][ccy]['deposit_rate'][0] + random_step
+                deposit_rate_rest = deposit_rate0 - np.random.uniform(low=0.0001, high=0.001, size=(num_limits - 1))
+                deposit_rates = np.array([deposit_rate0] + [deposit_rate_rest[i] for i in range(num_limits - 1)])
             except KeyError:
-                deposit_rates = self.rates[self.t][ccy]['deposit_rate'] + random_step
+                deposit_rate0 = self.rates[self.t][ccy]['deposit_rate'][0] + random_step
+                deposit_rate_rest = deposit_rate0 - np.random.uniform(low=0.0001, high=0.001, size=(num_limits - 1))
+                deposit_rates = np.array([deposit_rate0] + [deposit_rate_rest[i] for i in range(num_limits - 1)])
+
             deposit_rates = np.sort(deposit_rates)[::-1]
             self.rates[t_new][ccy]['deposit_rate'] = deposit_rates
         else:
@@ -516,7 +570,7 @@ class InterestRates:
     def init_deposit_rates(self, t_new, ccy):
         num_limits = len(self.rates[self.t][ccy]['deposit_limits'])
         deposit_rate0 = np.random.uniform(low=-0.005, high=0.05)
-        deposit_rate_rest = deposit_rate0 - np.random.uniform(low=0.001, high=0.01, size=(num_limits - 1))
+        deposit_rate_rest = deposit_rate0 - np.random.uniform(low=0.0001, high=0.001, size=(num_limits - 1))
         deposit_rates = np.array([deposit_rate0] + [deposit_rate_rest[i] for i in range(num_limits - 1)])
         deposit_rates = np.sort(deposit_rates)[::-1]
         self.rates[t_new][ccy]['deposit_rate'] = deposit_rates
@@ -569,9 +623,14 @@ class InterestRates:
                     update_overdraft_rate = True if np.random.rand() < 0.05 else False
                     self.update_overdraft_rate(t_new=t_new, ccy=ccy, update=update_overdraft_rate)
 
+                for t in self.rates:
+                    for ccy in self.currencies:
+                        assert np.equal(self.rates[t][ccy]['deposit_limits'], np.sort(self.rates[t][ccy][
+                                                                                          'deposit_limits'])).all(), f"{ccy}, {t}, {t_new}, {self.rates[t][ccy]['deposit_limits']}"
             else:
                 self.rates[t_new] = self.rates[self.t]
             self.t = t_new
+
 
     @classmethod
     def generate_random(cls, t1, t2, currencies, home_ccy):
@@ -610,7 +669,10 @@ class FXMargins:
     def update_margin(self, fees, ccy):
         margin_change = 1 + np.random.normal(loc=0, scale=0.10, size=len(self.currencies))
         fees.loc[ccy, :] *= margin_change
-        fees.loc[:, ccy] *= margin_change
+        try:
+            fees.loc[:, ccy] *= margin_change
+        except:
+            print("wtf")
         return fees
 
     def step(self, end_date=None):
@@ -729,11 +791,19 @@ class FXRates:
 
     @classmethod
     def generate_random(cls, t1, t2):
-        tickers = ["{}{}=X".format(ccy1, ccy2) for ccy1 in CURRENCIES for ccy2 in CURRENCIES if ccy2 != ccy1]
+        # tickers = ["{}{}=X".format(ccy1, ccy2) for ccy1 in CURRENCIES for ccy2 in CURRENCIES if ccy2 != ccy1]
         # historic_rates = yf.download(tickers=tickers, start=t1 + timedelta(days=1), end=t2 + timedelta(days=1))
         # close_rates = historic_rates['Close']
-        # close_rates.to_csv('close_rates.csv', index=True)
-        close_rates = pd.read_csv('close_rates.csv', index_col=0)
+        # close_rates.to_csv('data/close_rates.csv', index=True)
+        close_rates = pd.read_csv('data/close_rates.csv', index_col=0)
+
+        for ticker in close_rates.columns:
+            if close_rates.loc[:, ticker].isnull().all():
+                base_ccy = ticker[:3]
+                quote_ccy = ticker[3:6]
+                counter_tick = f"{quote_ccy}{base_ccy}=X"
+                close_rates.loc[:, ticker] = 1 / close_rates.loc[:, counter_tick]
+
         close_rates.index = pd.to_datetime(close_rates.index)
         days = [t1 + timedelta(days=days) for days in range((t2 - t1).days + 1)]
 

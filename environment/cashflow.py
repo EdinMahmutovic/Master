@@ -1,6 +1,7 @@
 import numpy as np
 from datetime import timedelta
 import pandas as pd
+from torch.utils.data import Dataset
 
 
 class CashFlow:
@@ -66,9 +67,20 @@ class CashFlow:
         else:
             return self.data.loc[t, :]
 
+    @staticmethod
+    def generate_random_dataset(num_cashflows, t1, t2, fx_rates, currencies, home_ccy):
+        cashflow_all = None
+        for _ in range(num_cashflows):
+            inst = CashFlow.generate_random(t1=t1, t2=t2, fx_rates=fx_rates, currencies=currencies, home_ccy=home_ccy)
+            cashflows = inst.data_local
+            if cashflow_all is None:
+                cashflow_all = cashflows.values.T
+            else:
+                cashflow_all = np.concatenate((cashflow_all, cashflows.values.T), axis=0)
+        return cashflow_all
+
     @classmethod
     def generate_random(cls, t1, t2, fx_rates, currencies, home_ccy):
-        base_ccy = cls.select_random_home_ccy(currencies)
         inst = cls(t1=t1, t2=t2, currencies=currencies, home_ccy=home_ccy)
 
         fx_rate_t0 = cls.get_baseline_fx_rates(fx_rates, t1)
@@ -90,10 +102,10 @@ class CashFlow:
         mean_outgoing_supplier_annual = cls.compute_expense_per_supplier(mean_expense_annual,
                                                                          supplier_outgoing_share_pct)
 
-        ccy_rates_customer = CashFlow.cashflow_ccy_conversion(base_ccy=base_ccy,
+        ccy_rates_customer = CashFlow.cashflow_ccy_conversion(base_ccy=home_ccy,
                                                               partner_ccy=inst.customer_ccy,
                                                               fx_rate_t0=fx_rate_t0)
-        ccy_rates_supplier = CashFlow.cashflow_ccy_conversion(base_ccy=base_ccy,
+        ccy_rates_supplier = CashFlow.cashflow_ccy_conversion(base_ccy=home_ccy,
                                                               partner_ccy=inst.supplier_ccy,
                                                               fx_rate_t0=fx_rate_t0)
 
@@ -226,3 +238,35 @@ class CashFlow:
     def select_random_home_ccy(currencies):
         base_ccy = currencies[0]
         return base_ccy
+
+
+class CashFlowDataLoader(Dataset):
+    def __init__(self, t1, t2, fx_rates, currencies, horizon=28, home_ccy='DKK', n_series=None, write_new=False):
+        self.n = n_series
+        self.t1 = t1
+        self.t2 = t2
+        self.horizon = horizon
+
+        if write_new:
+            self.x = CashFlow.generate_random_dataset(num_cashflows=n_series, t1=t1, t2=t2,
+                                                      fx_rates=fx_rates, currencies=currencies, home_ccy=home_ccy)
+            np.savetxt('../data/cashflow_data.csv', self.x, delimiter=',')
+        else:
+            self.x = pd.read_csv('../data/cashflow_data.csv', header=None).values
+            self.n = self.x.shape[0]
+
+    def __len__(self):
+        return self.n
+
+    def __getitem__(self, i):
+        delta_t = (self.t2 - self.t1).days
+        length = np.random.randint(low=180, high=delta_t) - 28
+        t1 = self.t1 + timedelta(days=np.random.randint(low=0, high=(delta_t - length)))
+        t2 = t1 + timedelta(days=length)
+
+        t1_idx = (t1 - self.t1).days
+        t2_idx = (t2 - self.t1).days
+
+        x = np.zeros_like(self.x[i, :])
+        x[:length] = self.x[i, t1_idx:t2_idx]
+        return x, length
